@@ -101,8 +101,8 @@ passes every check and never loads.
 
 ## Board (box opened by Tim; two photos)
 
-`HI3798CV200_V2.2_20170706` · label `K3:WW18040044 / Q10 PRO 2+16G / Q10PROV2.2DYC` · serial
-`POHMD180312617` · **2 GB RAM / 16 GB eMMC** (so `mem=1993M` is sane) · `AP6255` (BCM43455
+`HI3798CV200_V2.2_20170706` · label `<unit-label> / Q10 PRO 2+16G / Q10PROV2.2…` · serial
+`<board-serial>` · **2 GB RAM / 16 GB eMMC** (so `mem=1993M` is sane) · `AP6255` (BCM43455
 WiFi/BT, SDIO, `1753`) · `MHX HS2403 1812` · SATA data + 4-pin power **populated**.
 Unpopulated headers: **`J32` 3-pin at the bottom edge** (near `Q35/R244/R245`), **`J15` 9-pin row**
 mid-board, `J42`/`J43` 4-pin, `S10` switch footprint. Function **not identified** from a photo.

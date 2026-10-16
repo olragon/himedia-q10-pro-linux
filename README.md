@@ -1,11 +1,30 @@
 # HiMedia Q10 Pro on mainline Linux
 
+![The Q10 Pro's TV menu on mainline Linux: Desktop, Music, Kodi, Web, Android 13](docs/screenshots/menu.webp)
+
 Mainline **Linux 6.18** on the **HiMedia Q10 Pro** TV box (HiSilicon **Hi3798CV200**, 4× Cortex-A53,
 2 GB RAM, 3.5" SATA bay), running **Debian trixie (armhf)**. The box was brought up with **no serial
 console**. This repo holds what that took: the kernel patch series, the device tree, the build and
 bring-up tools, the TV session switcher, and the research notes behind each step.
 
 Every result below was measured on the box. Where a note only infers something, it says so.
+
+## Screenshots
+
+Captured from the box's own HDMI output (1080p, scaled down). Every screen below is mainline Linux on this box.
+
+| | |
+|---|---|
+| ![LXQt desktop with the start menu open](docs/screenshots/desktop.webp) | ![LXQt file manager (PCManFM-Qt) browsing the root filesystem](docs/screenshots/files.webp) |
+| **Desktop:** LXQt, GPU-accelerated through glamor, 293 MB in use | File manager (PCManFM-Qt), two windows, taskbar |
+| ![Kodi 21.2 Omega splash](docs/screenshots/kodi.webp) | ![Chromium full screen in the Web session](docs/screenshots/web.webp) |
+| **Kodi** 21.2 on GBM + GLES, V4L2-request hardware decode | **Web:** Chromium full screen on Wayland, video handed to a hardware mpv |
+| ![Android 13 lock screen](docs/screenshots/android13.webp) | ![Music mode idle screen](docs/screenshots/audio-ready.webp) |
+| **Android 13** (LineageOS 20 in Waydroid), launcher in 100 s from SATA | **Music:** AirPlay 2, Spotify Connect, UPnP, web library (LAN address pixelated) |
+| ![Now playing: FLAC 24/96, resampled to 48 kHz for the onboard output](docs/screenshots/nowplaying.webp) | ![kmscube rendered by the Mali-T720](docs/screenshots/kmscube.webp) |
+| Now playing: the screen says when the onboard 48 kHz path resamples | **GPU:** Panfrost on the Mali-T720, kmscube at 59.9 fps |
+| ![ffmpeg test pattern frame 150 decoded by the hardware VDEC](docs/screenshots/hwdec-after.webp) | ![The Q10 Pro mainboard, serial sticker pixelated](docs/photos/q10pro-mainboard-v2.2-ap6255.jpg) |
+| **Hardware decode:** frame 150 of the test pattern, md5-identical to software | The board: Hi3798CV200 under the heatsink, AP6255 WiFi, SATA header (serial pixelated) |
 
 ## What works
 
