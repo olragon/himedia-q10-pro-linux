@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device-tree nodes for the Hi3798CV200 Mali-T720 GPU (Panfrost), for OUR
+ * AArch32 tree.
+ *
+ * Source: the community 6.12 tree (hi3798cv200.dtsi, node gpu@f9200000) for the
+ * register window, the three interrupts and the clock/reset bits; the vendor
+ * 4.4 SDK (drivers/hisilicon/clk/hi3798cv2x/clk-higpu.c) for the clock
+ * sequence.  Tags: [read] = taken from a source file, [inferred] = reasoned,
+ * [tested] = compiled/validated here.  Nothing here has run on hardware.
+ *
+ * Needs, in this order: 0001..0009 (as today), 0010 (CRG GPU clock, id 61).
+ * No Panfrost patch is needed: "arm,mali-t720" is already in panfrost's
+ * of_match table (default_data) in 6.18.55. [read] panfrost_drv.c:941
+ *
+ * Add PART A and PART B to hi3798cv200-himedia-q10-pro.dts (or paste the gpu
+ * node into the soc node of hi3798cv200.dtsi and keep status = "disabled"
+ * there).  Compile-tested together with our dtsi + dts. [tested]
+ */
+
+/* ======================================================================== */
+/* PART A: the nodes                                                        */
+/* ======================================================================== */
+
+/ {
+	/*
+	 * Placeholder supply for panfrost's mandatory "mali" regulator lookup.
+	 *
+	 * The SoC can drive a core-voltage PWM at 0xf8a23020 (the community tree
+	 * has a driver for it, "hisilicon,hi3798cv200-gpu-regulator"), but a
+	 * retail box is under no obligation to wire that PWM to a DC-DC; the
+	 * Q10 Pro's wiring is NOT known. [inferred]  Writing a PWM duty to a
+	 * rail that is not connected does nothing, and writing one to a rail
+	 * that IS connected can under- or over-volt the core.  So: no
+	 * controllable regulator, no OPP table, no voltage changes.  The GPU
+	 * runs at whatever voltage the stock bootloader left on the core rail.
+	 *
+	 * No regulator-{min,max}-microvolt on purpose: we do not know the
+	 * voltage, and inventing one would be a false statement.
+	 */
+	vdd_gpu: regulator-vdd-gpu {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd-gpu";
+		regulator-always-on;
+		regulator-boot-on;
+	};
+};
+
+&soc {
+	/*
+	 * Mali-T720, 16 KiB register window at physical 0xf9200000.  Soc-relative
+	 * like every other node here (soc ranges = <0x0 0xf0000000 0x10000000>).
+	 *
+	 * WHY INSIDE &soc (the community tree put it at the TOP level):
+	 * there the soc node carries a 1 GiB dma-ranges, so the Mali was moved
+	 * out to inherit the unrestricted root window.  Our soc node already
+	 * has a 2 GiB dma-ranges (<0x0 0x0 0x80000000>) that covers all of RAM
+	 * (mem=1993M, top 0x7c900000), so no buffer the GPU can be handed is
+	 * out of its reach and the workaround is unnecessary.  Staying in &soc
+	 * keeps the one-bus-one-window rule and the soc-relative addressing of
+	 * vdec/vpss.  Panfrost's MMU is LPAE with a 40-bit mask, which the
+	 * 2 GiB window narrows to 31 bits via the bus limit - fine. [inferred]
+	 * If RAM ever grows past 2 GiB, widen the soc dma-ranges, not this node.
+	 *
+	 * NOT dma-coherent: the T720 has no ACE-Lite port. [inferred]
+	 */
+	gpu: gpu@9200000 {
+		compatible = "arm,mali-t720";
+		reg = <0x9200000 0x4000>;
+		/* GIC SPI numbers (physical IRQ = SPI + 32). [read] community dtsi */
+		interrupts = <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 141 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 143 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "job", "mmu", "gpu";
+
+		/*
+		 * Patch 0010.  The clock owns gate AND soft reset (CRG 0xd4
+		 * bits 0 and 4), so there is deliberately NO `resets` here:
+		 * a second owner of bit 4 could leave the GPU held in reset
+		 * behind the clock's back.  The community tree lists
+		 * `resets = <&crg 0xd4 4>` as well; with our 0010 that is
+		 * harmless but redundant. [inferred]
+		 */
+		clocks = <&crg HISTB_GPU_CLK>;
+		clock-names = "core";
+
+		mali-supply = <&vdd_gpu>;
+
+		/*
+		 * Bring-up: leave the rate at the clock's safe default (200 MHz,
+		 * the vendor's index 0).  Once the driver is stable, uncomment to
+		 * pin 400 MHz - the highest point that needs no voltage change in
+		 * the vendor table (opp 200..500 MHz are all 880 mV; 600 and
+		 * 675 MHz need more). [read] community dvbip.dtsi OPP table.
+		 * Valid rates: 200/300/400/500/600/675 MHz.
+		 */
+		/* assigned-clocks = <&crg HISTB_GPU_CLK>; */
+		/* assigned-clock-rates = <400000000>; */
+
+		status = "disabled";
+	};
+};
+
+/* ======================================================================== */
+/* PART B: board dts - switch it on                                         */
+/* ======================================================================== */
+
+&gpu {
+	status = "okay";
+};

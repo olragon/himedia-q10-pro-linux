@@ -1,0 +1,694 @@
+LOCAL PATCH (not submitted anywhere): drm/bridge: histb-hdmi: add a CEC adapter for the HDMI transmitter
+
+HDMI CEC for the Hi3798CV200 (HiMedia Q10 Pro), on top of 0016/0017.
+
+The CEC engine is the "CPI" block of the Silicon Image "imagev200" core: page 0xf of the TX register
+file, i.e. 0xf8ce3c00 + 4 * reg (reg 0x80..0xe4) inside the 0xf8ce0000 window the bridge already maps.
+There is no separate ioremap, reset or CRG block; its gate is the "cec" clock (CRG 0x10c bit 1) that
+0015/0016 already enable, and SPI 147 ("cec") is its interrupt.  A single TX buffer (opcode + 15
+operands), a 3-frame RX FIFO, a 16-bit capture-address mask.  Register map, bit meanings and the
+sequence all come from the vendor SDK (hdmi_2_0/hal/ctrl/imagev200/hal_cec.c, driver/cpi/si_drv_cpi.c,
+si_drv_tx_regs.h) and were cross-checked against the stock 3.18 kernel (CPI base 0x3f00 passed by
+HAL_HDMI_Open -> SiiCecDeviceCreate).
+
+The adapter is NOT hand-registered: the bridge sets DRM_BRIDGE_OP_HDMI_CEC_ADAPTER and implements
+hdmi_cec_{init,enable,log_addr,transmit}; drm_bridge_connector (which histb_vdp already uses) calls
+drmm_connector_hdmi_cec_register(), so the physical address is taken from the sink's EDID by
+drm_edid_connector_update() and the adapter gets CEC_CAP_RC (with MEDIA_CEC_RC, the TV remote's
+User Control keys become an rc-cec input device).  Received frames and transmit results go back
+through drm_connector_hdmi_cec_received_msg() / _transmit_attempt_done().
+
+Behaviour:
+
+  * Polled, like the vendor driver (it polls INT_STATUS from a 100 ms timer): every 20 ms while the
+    adapter is enabled, every 5 ms while a frame is on the wire.  cec_irq=1 additionally requests
+    SPI 147 (polarity unverified) to bring the poll forward; the poll stays as the safety net.
+  * The CEC core does the retries: the hardware retry limit is 0 and a missing acknowledge (the
+    "retry count exceeded" status) is reported as CEC_TX_STATUS_NACK.  Success is declared only
+    after the frame can have ended AND the TX-empty/changed status latched, because the vendor's
+    "acknowledged" bit is not proven to mean "completed".  The TX buffer is flushed before the retry
+    status is cleared, as the vendor does, or the frame is re-sent.
+  * Probe only READS the block (id 0xcc, spec, revision, line level): the adopted-link rule of 0016
+    holds.  A takeover of the link (bus/core reset) clears the block; hw_init re-applies the enabled
+    state through histb_hdmi_cec_restore().
+  * Fallback: cec=0 never registers an adapter and never touches the CEC registers.
+  * debugfs /sys/kernel/debug/histb-hdmi/cec: block id, wire level, start-bit timer, ids, status.
+  * Not supported: --monitor-all (the DRM helper's adapter has no monitor_all op), more than one
+    logical address.
+
+Not tested on hardware.  Needs 0016 (and 0015/0017 for the display it lives next to).
+--- a/drivers/gpu/drm/bridge/hisilicon/Kconfig
++++ b/drivers/gpu/drm/bridge/hisilicon/Kconfig
+@@ -20,3 +20,19 @@
+ 	  untouched until the first commit that asks for a different mode.
+ 
+ 	  If M is selected, the module will be called histb-hdmi.
++
++config DRM_HISI_HISTB_HDMI_CEC
++	bool "HDMI CEC for the HiSilicon HiSTB HDMI transmitter"
++	depends on DRM_HISI_HISTB_HDMI
++	select CEC_CORE
++	select DRM_DISPLAY_HDMI_CEC_HELPER
++	default y
++	help
++	  Expose the CEC engine of the transmitter (the "CPI" block of the Silicon
++	  Image core: TX/RX frame FIFOs, a capture-address mask, a start-bit timer)
++	  as a /dev/cecN adapter through the DRM bridge-connector CEC helpers.  The
++	  physical address comes from the sink's EDID.  With MEDIA_CEC_RC the TV
++	  remote's User Control keys appear as an input device.
++
++	  The module parameter cec=0 skips the adapter and never touches the CEC
++	  registers.
+--- a/drivers/gpu/drm/bridge/hisilicon/histb-hdmi.c
++++ b/drivers/gpu/drm/bridge/hisilicon/histb-hdmi.c
+@@ -26,6 +26,8 @@
+  *    up and puts the previous link back.
+  *  - HDMI audio configured by another driver (q10_aiao) is saved before a TX reset
+  *    and put back after TMDS is up, so a mode switch does not silence it.
++ *  - HDMI CEC (histb-hdmi-cec.h): the CPI block of the same core, exposed as a CEC adapter
++ *    through the DRM bridge-connector CEC helpers.  cec=0 leaves it alone.
+  *
+  * Not tested on hardware.
+  */
+@@ -363,6 +365,8 @@
+ 	},
+ };
+ 
++struct histb_hdmi_cec;
++
+ struct histb_hdmi {
+ 	struct device *dev;
+ 	void __iomem *base;
+@@ -400,6 +404,8 @@
+ 		u8 aif[HISTB_HDMI_INFOFRAME_BYTES];
+ 		u8 aif_ctrl;
+ 	} audio;
++
++	struct histb_hdmi_cec *cec;	/* histb-hdmi-cec.h; NULL when cec=0 or CONFIG off */
+ 
+ 	struct dentry *debugfs;
+ };
+@@ -453,6 +459,8 @@
+ 
+ 	histb_hdmi_writew(hdmi, reg, (regval & ~mask) | (value & mask));
+ }
++
++#include "histb-hdmi-cec.h"
+ 
+ static void histb_hdmi_reset_video_path(struct histb_hdmi *hdmi)
+ {
+@@ -940,6 +948,8 @@
+ 	histb_hdmi_video_path_hw_init(hdmi);
+ 	histb_hdmi_tmds_enable(hdmi, false);
+ 	histb_hdmi_disable_infoframes(hdmi);
++	/* the bus/core reset above wipes the CEC block too: put back the logical address and enables */
++	histb_hdmi_cec_restore(hdmi);
+ 
+ 	return 0;
+ }
+@@ -2066,6 +2076,12 @@
+ 	.hdmi_tmds_char_rate_valid = histb_hdmi_tmds_char_rate_valid,
+ 	.hdmi_clear_infoframe = histb_hdmi_clear_infoframe,
+ 	.hdmi_write_infoframe = histb_hdmi_write_infoframe,
++#ifdef CONFIG_DRM_HISI_HISTB_HDMI_CEC
++	.hdmi_cec_init = histb_hdmi_cec_init,
++	.hdmi_cec_enable = histb_hdmi_cec_enable,
++	.hdmi_cec_log_addr = histb_hdmi_cec_log_addr,
++	.hdmi_cec_transmit = histb_hdmi_cec_transmit,
++#endif
+ };
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -2251,6 +2267,7 @@
+ 		BIT(HDMI_COLORSPACE_YUV422) |
+ 		BIT(HDMI_COLORSPACE_YUV420);
+ 	hdmi->bridge.max_bpc = 12;
++	histb_hdmi_cec_probe(hdmi);
+ 
+ 	ret = devm_drm_bridge_add(dev, &hdmi->bridge);
+ 	if (ret)
+@@ -2264,6 +2281,7 @@
+ 	debugfs_create_file("regs", 0444, hdmi->debugfs, hdmi, &histb_hdmi_regs_fops);
+ 	if (allow_poke)
+ 		debugfs_create_file("poke", 0200, hdmi->debugfs, hdmi, &histb_hdmi_poke_fops);
++	histb_hdmi_cec_debugfs(hdmi, hdmi->debugfs);
+ #endif
+ 
+ 	dev_info(dev, "HDMI bridge registered (TX id %02x%02x%02x%02x, HPD/RSEN 0x%02x, SYS_STAT 0x%02x); the bootloader's link is untouched\n",
+@@ -2286,6 +2304,7 @@
+ {
+ 	struct histb_hdmi *hdmi = platform_get_drvdata(pdev);
+ 
++	histb_hdmi_cec_remove(hdmi);
+ 	debugfs_remove_recursive(hdmi->debugfs);
+ 	WRITE_ONCE(hdmi->hpd_enabled, false);
+ 	histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1_MASK, 0);
+--- /dev/null
++++ b/drivers/gpu/drm/bridge/hisilicon/histb-hdmi-cec.h
+@@ -0,0 +1,546 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * HDMI CEC for the HiSTB HDMI transmitter.
++ *
++ * Not a header in the usual sense: the code of ONE translation unit, kept in its own file so the
++ * CEC engine can be read (and deleted) apart from the 2,300-line transmitter driver.  It is
++ * included by histb-hdmi.c after the register accessors and needs struct histb_hdmi.
++ *
++ * What the hardware is (all of it read from the vendor SDK, see docs/261012-himedia-hdmi-cec.md):
++ *
++ *  - The "CPI" block of the Silicon Image "imagev200" core, INSIDE the TX register window, as
++ *    page 0xf of the same 8-bit-register-per-32-bit-word file the rest of this driver uses:
++ *    0xf8ce0000 + ((0xf << 8 | reg) << 2) = 0xf8ce3c00 + 4 * reg, reg 0x80..0xe4.  No separate
++ *    ioremap, no separate reset.  Its gate is the "cec" clock (CRG 0x10c bit 1) already enabled
++ *    by probe with the other HDMI gates; SPI 147 ("cec") is its interrupt line.
++ *  - One TX buffer (command byte + 15 operands, "FIFO" depth 2) and an RX FIFO of three frames.
++ *    The header byte is not in either: the initiator is TX_INIT, the destination TX_DEST.  A frame
++ *    with no opcode (a poll) is sent with TX_DEST bit 7 (SD_POLL) instead of a command.
++ *  - Reception is gated by a 16-bit capture mask (CAPTURE_ID0/1, bit n = logical address n);
++ *    broadcast is always accepted and acknowledged by the hardware.
++ *  - The vendor driver never uses the interrupt: it polls the two INT_STATUS registers from a
++ *    100 ms timer.  So do we (20 ms while enabled, 5 ms while a frame is on the wire), and the
++ *    interrupt is an opt-in (cec_irq=1) that only brings the poll forward.
++ */
++#ifndef HISTB_HDMI_CEC_H
++#define HISTB_HDMI_CEC_H
++
++#ifndef CONFIG_DRM_HISI_HISTB_HDMI_CEC
++
++static inline void histb_hdmi_cec_probe(struct histb_hdmi *hdmi) { }
++static inline void histb_hdmi_cec_restore(struct histb_hdmi *hdmi) { }
++static inline void histb_hdmi_cec_remove(struct histb_hdmi *hdmi) { }
++#ifdef CONFIG_DEBUG_FS
++static inline void histb_hdmi_cec_debugfs(struct histb_hdmi *hdmi, struct dentry *dir) { }
++#endif
++
++#else /* CONFIG_DRM_HISI_HISTB_HDMI_CEC */
++
++#include <drm/display/drm_hdmi_cec_helper.h>
++#include <media/cec.h>
++
++static bool cec_adapter = true;
++module_param_named(cec, cec_adapter, bool, 0444);
++MODULE_PARM_DESC(cec, "register a CEC adapter (/dev/cecN); 0 never touches the CEC registers (default 1)");
++
++static bool cec_debug;
++module_param(cec_debug, bool, 0644);
++MODULE_PARM_DESC(cec_debug, "log every CEC frame sent/received and the raw status bits (default 0)");
++
++static bool cec_irq;
++module_param(cec_irq, bool, 0444);
++MODULE_PARM_DESC(cec_irq, "also request SPI 147 and service CEC from it; polling stays as the safety net (default 0)");
++
++/* CPI registers: page 0xf.  Names follow the vendor header si_drv_tx_regs.h. */
++#define HISTB_CEC_REG(r)		HISTB_HDMI_REG(0xf, (r))
++#define HISTB_CEC_DEVICE_ID		HISTB_CEC_REG(0x80)	/* RO, 0xcc */
++#define HISTB_CEC_SPEC			HISTB_CEC_REG(0x81)
++#define HISTB_CEC_HARDWARE_REV		HISTB_CEC_REG(0x83)
++#define HISTB_CEC_DEBUG_0		HISTB_CEC_REG(0x84)	/* RO start-bit low period, 250 us units */
++#define HISTB_CEC_DEBUG_1		HISTB_CEC_REG(0x85)	/* RO start-bit period, 250 us units */
++#define HISTB_CEC_DEBUG_3		HISTB_CEC_REG(0x87)
++#define HISTB_CEC_NACK_HDR		BIT(1)	/* 1: do not acknowledge header blocks */
++#define HISTB_CEC_FLUSH_TX		BIT(7)	/* self-clearing */
++#define HISTB_CEC_TX_INIT		HISTB_CEC_REG(0x88)	/* initiator id */
++#define HISTB_CEC_TX_DEST		HISTB_CEC_REG(0x89)	/* destination id */
++#define HISTB_CEC_TX_POLL		BIT(7)	/* send a header-only frame, self-clearing */
++/* HISTB_HDMI_CEC_CONFIG_CPI (0x8e) bit 4: pass the CEC bus through to the I2C master; 1 = disabled */
++#define HISTB_CEC_PASSTHRU		BIT(4)
++#define HISTB_CEC_TX_COMMAND		HISTB_CEC_REG(0x8f)	/* opcode */
++#define HISTB_CEC_TX_OPERAND(i)		HISTB_CEC_REG(0x90 + (i))	/* 0..14 */
++#define HISTB_CEC_TRANSMIT_DATA		HISTB_CEC_REG(0x9f)
++#define HISTB_CEC_SEND			BIT(4)	/* low nibble: operand count */
++#define HISTB_CEC_RETRY_LIMIT		HISTB_CEC_REG(0xa0)	/* retries after the first try */
++#define HISTB_CEC_CAPTURE_ID0		HISTB_CEC_REG(0xa2)
++#define HISTB_CEC_CAPTURE_ID1		HISTB_CEC_REG(0xa3)
++#define HISTB_CEC_INT_ENABLE_0		HISTB_CEC_REG(0xa4)
++#define HISTB_CEC_INT_ENABLE_1		HISTB_CEC_REG(0xa5)
++#define HISTB_CEC_INT_STATUS_0		HISTB_CEC_REG(0xa6)	/* write 1 to clear */
++#define HISTB_CEC_INT_STATUS_1		HISTB_CEC_REG(0xa7)	/* write 1 to clear */
++#define HISTB_CEC_RX_CONTROL		HISTB_CEC_REG(0xac)
++#define HISTB_CEC_RX_CLR_CUR		BIT(0)
++#define HISTB_CEC_RX_CLR_ALL		BIT(1)
++#define HISTB_CEC_RX_COUNT		HISTB_CEC_REG(0xad)	/* [7] error [5:4] frames [3:0] operands */
++#define HISTB_CEC_RX_ERROR		BIT(7)
++#define HISTB_CEC_RX_CMD_HEADER		HISTB_CEC_REG(0xae)	/* initiator << 4 | destination */
++#define HISTB_CEC_RX_COMMAND		HISTB_CEC_REG(0xaf)
++#define HISTB_CEC_RX_OPERAND(i)		HISTB_CEC_REG(0xb0 + (i))
++
++#define HISTB_CEC_ST0_RX_CMD		BIT(0)
++#define HISTB_CEC_ST0_RX_NEMPTY		BIT(1)
++#define HISTB_CEC_ST0_TX_EMPTY		BIT(2)
++#define HISTB_CEC_ST0_TX_CSTATE		BIT(5)	/* "transmit buffer full/empty change": vendor calls it ACKED */
++#define HISTB_CEC_ST0_TX_FULL		BIT(6)
++#define HISTB_CEC_ST0_LINE		BIT(7)	/* RO: the CEC wire, 1 = high (idle) */
++#define HISTB_CEC_ST1_START_ODD		BIT(0)
++#define HISTB_CEC_ST1_RETX		BIT(1)	/* retry limit exhausted: the frame was NOT acknowledged */
++#define HISTB_CEC_ST1_SHORT_PULSE	BIT(2)
++#define HISTB_CEC_ST1_RX_OVERRUN	BIT(3)
++#define HISTB_CEC_ST1_LOW_BIT		BIT(4)
++
++/* what the vendor driver enables (si_drv_cpi.c SiiDrvCpiEnable) */
++#define HISTB_CEC_ST0_ENABLE	(HISTB_CEC_ST0_RX_NEMPTY | HISTB_CEC_ST0_TX_EMPTY | HISTB_CEC_ST0_TX_CSTATE)
++#define HISTB_CEC_ST1_ENABLE	(HISTB_CEC_ST1_RETX | HISTB_CEC_ST1_SHORT_PULSE | \
++				 HISTB_CEC_ST1_START_ODD | HISTB_CEC_ST1_RX_OVERRUN)
++/* status bits that are write-one-to-clear events */
++#define HISTB_CEC_ST0_EVENTS	(HISTB_CEC_ST0_RX_CMD | HISTB_CEC_ST0_RX_NEMPTY | HISTB_CEC_ST0_TX_EMPTY | \
++				 HISTB_CEC_ST0_TX_CSTATE | HISTB_CEC_ST0_TX_FULL)
++#define HISTB_CEC_ST1_EVENTS	(HISTB_CEC_ST1_START_ODD | HISTB_CEC_ST1_RETX | HISTB_CEC_ST1_SHORT_PULSE | \
++				 HISTB_CEC_ST1_RX_OVERRUN | HISTB_CEC_ST1_LOW_BIT)
++
++#define HISTB_CEC_BLOCK_ID		0xcc
++#define HISTB_CEC_RX_FIFO_FRAMES	3
++#define HISTB_CEC_POLL_IDLE_MS		20
++#define HISTB_CEC_POLL_IRQ_MS		200
++#define HISTB_CEC_POLL_TX_MS		5
++/* CEC timing: 4.5 ms start bit + 10 bits (8 data, EOM, ACK) of 2.4 ms per byte */
++#define HISTB_CEC_START_MS		5
++#define HISTB_CEC_BYTE_MS		25
++#define HISTB_CEC_SETTLE_MS		20
++#define HISTB_CEC_TX_SLACK_MS		300
++
++struct histb_hdmi_cec {
++	struct histb_hdmi *hdmi;
++	struct drm_connector *connector;
++	struct delayed_work work;
++	struct mutex lock;	/* the CPI registers and every field below */
++	bool alive;		/* hdmi->base is still mapped (cleared by remove()) */
++	bool on;		/* between adap_enable(true) and adap_enable(false) */
++	u8 la;			/* CEC_LOG_ADDR_INVALID when none */
++	int irq;		/* SPI 147 when cec_irq=1 and requested, else -1 */
++
++	bool tx_busy;
++	bool tx_seen_done;	/* TX_EMPTY or TX_CSTATE latched since the frame started */
++	unsigned long tx_start;
++	unsigned int tx_min_ms;	/* success is not declared before the frame can have ended */
++	unsigned int tx_max_ms;
++};
++
++#define histb_cec_dbg(c, fmt, ...) \
++	do { if (cec_debug) dev_info((c)->hdmi->dev, "cec: " fmt, ##__VA_ARGS__); } while (0)
++
++static void histb_cec_set_ids(struct histb_hdmi_cec *c)
++{
++	struct histb_hdmi *hdmi = c->hdmi;
++	u16 capture = 0;
++	u8 init = 0xf;		/* unregistered */
++
++	if (c->la < 15) {
++		capture = BIT(c->la);
++		init = c->la;
++	}
++	histb_hdmi_writeb(hdmi, HISTB_CEC_CAPTURE_ID0, capture & 0xff);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_CAPTURE_ID1, capture >> 8);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_TX_INIT, init);
++}
++
++/* The vendor's SiiDrvCpiEnable, plus the retry limit (0: the CEC core does the retries). */
++static void histb_cec_hw_enable(struct histb_hdmi_cec *c)
++{
++	struct histb_hdmi *hdmi = c->hdmi;
++
++	histb_hdmi_updateb(hdmi, HISTB_HDMI_CEC_CONFIG_CPI, HISTB_CEC_PASSTHRU, 0);
++	/* acknowledge headers again; the vendor sets NACK_HDR while disabled so it cannot disturb the bus */
++	histb_hdmi_updateb(hdmi, HISTB_CEC_DEBUG_3, HISTB_CEC_NACK_HDR, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_RETRY_LIMIT, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_RX_CONTROL, HISTB_CEC_RX_CLR_ALL);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_STATUS_0, HISTB_CEC_ST0_EVENTS);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_STATUS_1, HISTB_CEC_ST1_EVENTS);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_0, HISTB_CEC_ST0_ENABLE);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_1, HISTB_CEC_ST1_ENABLE);
++	histb_cec_set_ids(c);
++}
++
++/* The vendor's SiiDrvCpiDisable (minus its write to a non-existent page-0xf SW_RST3). */
++static void histb_cec_hw_disable(struct histb_hdmi_cec *c)
++{
++	struct histb_hdmi *hdmi = c->hdmi;
++
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_0, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_1, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_CAPTURE_ID0, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_CAPTURE_ID1, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_RX_CONTROL, HISTB_CEC_RX_CLR_ALL);
++	histb_hdmi_updateb(hdmi, HISTB_HDMI_CEC_CONFIG_CPI, HISTB_CEC_PASSTHRU, HISTB_CEC_PASSTHRU);
++	histb_hdmi_updateb(hdmi, HISTB_CEC_DEBUG_3, HISTB_CEC_NACK_HDR, HISTB_CEC_NACK_HDR);
++}
++
++static void histb_cec_flush_tx(struct histb_hdmi_cec *c)
++{
++	histb_hdmi_updateb(c->hdmi, HISTB_CEC_DEBUG_3, HISTB_CEC_FLUSH_TX, HISTB_CEC_FLUSH_TX);
++}
++
++static unsigned int histb_cec_frame_ms(unsigned int len)
++{
++	return HISTB_CEC_START_MS + len * HISTB_CEC_BYTE_MS;
++}
++
++/*
++ * Read at most one RX FIFO's worth of frames.  A frame the hardware flagged as bad is dropped.  The
++ * hardware stores a frame as {opcode, operands}; a header-only frame (a poll) is either not stored or
++ * stored with opcode 0 and no operands - both are dropped, since <Feature Abort> (opcode 0) always
++ * carries two operands.
++ */
++static unsigned int histb_cec_rx(struct histb_hdmi_cec *c, struct cec_msg *out)
++{
++	struct histb_hdmi *hdmi = c->hdmi;
++	unsigned int n = 0, i, j;
++
++	for (i = 0; i < HISTB_CEC_RX_FIFO_FRAMES; i++) {
++		u8 cnt = histb_hdmi_readb(hdmi, HISTB_CEC_RX_COUNT);
++		unsigned int frames = (cnt >> 4) & 3;
++		unsigned int ops = min_t(unsigned int, cnt & 0x0f, CEC_MAX_MSG_SIZE - 2);
++		struct cec_msg *m = &out[n];
++		u8 hdr, op;
++
++		if (!frames)
++			break;
++		hdr = histb_hdmi_readb(hdmi, HISTB_CEC_RX_CMD_HEADER);
++		op = histb_hdmi_readb(hdmi, HISTB_CEC_RX_COMMAND);
++		memset(m, 0, sizeof(*m));
++		m->msg[0] = hdr;
++		m->msg[1] = op;
++		for (j = 0; j < ops; j++)
++			m->msg[2 + j] = histb_hdmi_readb(hdmi, HISTB_CEC_RX_OPERAND(j));
++		m->len = 2 + ops;
++		histb_hdmi_writeb(hdmi, HISTB_CEC_RX_CONTROL, HISTB_CEC_RX_CLR_CUR);
++
++		histb_cec_dbg(c, "rx %s hdr %02x op %02x +%u operands%s\n", (cnt & HISTB_CEC_RX_ERROR) ? "BAD" : "frame",
++			      hdr, op, ops, (!op && !ops) ? " (dropped)" : "");
++		if ((cnt & HISTB_CEC_RX_ERROR) || (!op && !ops))
++			continue;
++		n++;
++	}
++	return n;
++}
++
++static void histb_cec_work(struct work_struct *work)
++{
++	struct histb_hdmi_cec *c = container_of(to_delayed_work(work), struct histb_hdmi_cec, work);
++	struct histb_hdmi *hdmi = c->hdmi;
++	struct cec_msg rx[HISTB_CEC_RX_FIFO_FRAMES];
++	struct drm_connector *connector;
++	unsigned int n_rx = 0, i;
++	u8 st0, st1, tx_status = 0;
++	bool resched;
++
++	mutex_lock(&c->lock);
++	if (!c->alive || !c->on) {
++		mutex_unlock(&c->lock);
++		return;
++	}
++	connector = c->connector;
++
++	st0 = histb_hdmi_readb(hdmi, HISTB_CEC_INT_STATUS_0);
++	st1 = histb_hdmi_readb(hdmi, HISTB_CEC_INT_STATUS_1);
++	/* The vendor flushes the TX buffer BEFORE clearing the retry status, or the frame is sent again. */
++	if (st1 & HISTB_CEC_ST1_RETX)
++		histb_cec_flush_tx(c);
++	if (st0 & HISTB_CEC_ST0_EVENTS)
++		histb_hdmi_writeb(hdmi, HISTB_CEC_INT_STATUS_0, st0 & HISTB_CEC_ST0_EVENTS);
++	if (st1 & HISTB_CEC_ST1_EVENTS)
++		histb_hdmi_writeb(hdmi, HISTB_CEC_INT_STATUS_1, st1 & HISTB_CEC_ST1_EVENTS);
++	if (c->irq >= 0) {
++		histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_0, HISTB_CEC_ST0_ENABLE);
++		histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_1, HISTB_CEC_ST1_ENABLE);
++	}
++	if ((st0 & HISTB_CEC_ST0_EVENTS) || (st1 & HISTB_CEC_ST1_EVENTS))
++		histb_cec_dbg(c, "status0 %02x status1 %02x%s\n", st0, st1, c->tx_busy ? " (tx busy)" : "");
++
++	if (c->tx_busy) {
++		unsigned int ms = jiffies_to_msecs(jiffies - c->tx_start);
++
++		if (st0 & (HISTB_CEC_ST0_TX_EMPTY | HISTB_CEC_ST0_TX_CSTATE))
++			c->tx_seen_done = true;
++		if (st1 & HISTB_CEC_ST1_RETX) {
++			tx_status = CEC_TX_STATUS_NACK;
++		} else if (c->tx_seen_done && ms >= c->tx_min_ms) {
++			tx_status = CEC_TX_STATUS_OK;
++		} else if (ms >= c->tx_max_ms) {
++			tx_status = CEC_TX_STATUS_ERROR;
++			histb_cec_flush_tx(c);
++		}
++		if (tx_status) {
++			histb_cec_dbg(c, "tx done after %u ms, status 0x%02x\n", ms, tx_status);
++			c->tx_busy = false;
++		}
++	}
++
++	n_rx = histb_cec_rx(c, rx);
++	resched = c->on;
++	mutex_unlock(&c->lock);
++
++	/*
++	 * The CEC core takes its own lock in both calls and holds it while it calls adap_enable(), so they
++	 * are made with ours dropped - and adap_enable(false) must never wait for this work.
++	 */
++	if (!connector || !connector->cec.data)
++		return;
++	if (tx_status)
++		drm_connector_hdmi_cec_transmit_attempt_done(connector, tx_status);
++	for (i = 0; i < n_rx; i++)
++		drm_connector_hdmi_cec_received_msg(connector, &rx[i]);
++
++	if (resched && READ_ONCE(c->on))
++		schedule_delayed_work(&c->work, msecs_to_jiffies(c->tx_busy ? HISTB_CEC_POLL_TX_MS :
++				      c->irq >= 0 ? HISTB_CEC_POLL_IRQ_MS : HISTB_CEC_POLL_IDLE_MS));
++}
++
++/* An event while enabled: bring the poll forward and mask the line until the work has cleared it. */
++static irqreturn_t histb_cec_irq(int irq, void *data)
++{
++	struct histb_hdmi_cec *c = data;
++	struct histb_hdmi *hdmi = c->hdmi;
++
++	if (!READ_ONCE(c->alive) || !READ_ONCE(c->on))
++		return IRQ_NONE;
++	if (!(histb_hdmi_readb(hdmi, HISTB_CEC_INT_STATUS_0) & HISTB_CEC_ST0_ENABLE) &&
++	    !(histb_hdmi_readb(hdmi, HISTB_CEC_INT_STATUS_1) & HISTB_CEC_ST1_ENABLE))
++		return IRQ_NONE;
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_0, 0);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_ENABLE_1, 0);
++	mod_delayed_work(system_wq, &c->work, 0);
++	return IRQ_HANDLED;
++}
++
++/* ---- drm_bridge_funcs: called by the DRM CEC helper, with the CEC core's adap->lock held ---- */
++
++static int histb_hdmi_cec_init(struct drm_bridge *bridge, struct drm_connector *connector)
++{
++	struct histb_hdmi_cec *c = bridge_to_histb_hdmi(bridge)->cec;
++
++	c->connector = connector;
++	return 0;
++}
++
++static int histb_hdmi_cec_enable(struct drm_bridge *bridge, bool enable)
++{
++	struct histb_hdmi_cec *c = bridge_to_histb_hdmi(bridge)->cec;
++
++	mutex_lock(&c->lock);
++	if (!c->alive) {
++		mutex_unlock(&c->lock);
++		return enable ? -ENODEV : 0;
++	}
++	if (enable) {
++		c->la = CEC_LOG_ADDR_INVALID;
++		c->tx_busy = false;
++		histb_cec_hw_enable(c);
++		c->on = true;
++		schedule_delayed_work(&c->work, 0);
++	} else {
++		c->on = false;
++		c->tx_busy = false;
++		histb_cec_hw_disable(c);
++		/* not _sync: the work may be waiting for the lock our caller holds */
++		cancel_delayed_work(&c->work);
++	}
++	mutex_unlock(&c->lock);
++	histb_cec_dbg(c, "adapter %s\n", enable ? "enabled" : "disabled");
++	return 0;
++}
++
++static int histb_hdmi_cec_log_addr(struct drm_bridge *bridge, u8 logical_addr)
++{
++	struct histb_hdmi_cec *c = bridge_to_histb_hdmi(bridge)->cec;
++
++	mutex_lock(&c->lock);
++	if (!c->alive) {
++		mutex_unlock(&c->lock);
++		return 0;
++	}
++	c->la = logical_addr;
++	histb_cec_set_ids(c);
++	mutex_unlock(&c->lock);
++	histb_cec_dbg(c, "logical address %u\n", logical_addr);
++	return 0;
++}
++
++static int histb_hdmi_cec_transmit(struct drm_bridge *bridge, u8 attempts, u32 signal_free_time,
++				   struct cec_msg *msg)
++{
++	struct histb_hdmi_cec *c = bridge_to_histb_hdmi(bridge)->cec;
++	struct histb_hdmi *hdmi = c->hdmi;
++	u8 init = msg->msg[0] >> 4, dest = msg->msg[0] & 0xf;
++	unsigned int i, frame_ms;
++
++	if (msg->len < 1 || msg->len > CEC_MAX_MSG_SIZE)
++		return -EINVAL;
++
++	mutex_lock(&c->lock);
++	if (!c->alive || !c->on) {
++		mutex_unlock(&c->lock);
++		return -EIO;
++	}
++	if (c->tx_busy)		/* the core gave up on the previous frame */
++		histb_cec_flush_tx(c);
++
++	/* Forget the previous frame's result, as the vendor does before every send. */
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_STATUS_0, HISTB_CEC_ST0_TX_FULL | HISTB_CEC_ST0_TX_CSTATE |
++			  HISTB_CEC_ST0_TX_EMPTY);
++	histb_hdmi_writeb(hdmi, HISTB_CEC_INT_STATUS_1, HISTB_CEC_ST1_RETX);
++
++	histb_hdmi_writeb(hdmi, HISTB_CEC_TX_INIT, init);
++	if (msg->len == 1) {
++		/* header only: a poll (logical-address allocation, cec-ctl --poll) */
++		histb_hdmi_writeb(hdmi, HISTB_CEC_TX_DEST, HISTB_CEC_TX_POLL | dest);
++	} else {
++		histb_hdmi_writeb(hdmi, HISTB_CEC_TX_DEST, dest);
++		histb_hdmi_writeb(hdmi, HISTB_CEC_TX_COMMAND, msg->msg[1]);
++		for (i = 2; i < msg->len; i++)
++			histb_hdmi_writeb(hdmi, HISTB_CEC_TX_OPERAND(i - 2), msg->msg[i]);
++		histb_hdmi_writeb(hdmi, HISTB_CEC_TRANSMIT_DATA, HISTB_CEC_SEND | (msg->len - 2));
++	}
++
++	frame_ms = histb_cec_frame_ms(msg->len);
++	c->tx_busy = true;
++	c->tx_seen_done = false;
++	c->tx_start = jiffies;
++	c->tx_min_ms = frame_ms + HISTB_CEC_SETTLE_MS;
++	c->tx_max_ms = frame_ms + HISTB_CEC_TX_SLACK_MS;
++	histb_cec_dbg(c, "tx %02x len %u op %02x\n", msg->msg[0], msg->len, msg->len > 1 ? msg->msg[1] : 0);
++	mod_delayed_work(system_wq, &c->work, msecs_to_jiffies(HISTB_CEC_POLL_TX_MS));
++	mutex_unlock(&c->lock);
++	return 0;
++}
++
++/* ---- called from histb-hdmi.c ---- */
++
++/*
++ * Allocate the state and ask the bridge connector for an adapter.  Only reads the hardware (the
++ * block id), so it keeps the "probe changes nothing" rule of the adopted link.  Any failure here
++ * leaves the bridge without CEC, never without display.
++ */
++static void histb_hdmi_cec_probe(struct histb_hdmi *hdmi)
++{
++	struct platform_device *pdev = to_platform_device(hdmi->dev);
++	struct histb_hdmi_cec *c;
++	u8 id;
++	int irq;
++
++	if (!cec_adapter) {
++		dev_info(hdmi->dev, "CEC adapter disabled (cec=0); the CEC registers are not touched\n");
++		return;
++	}
++
++	c = devm_kzalloc(hdmi->dev, sizeof(*c), GFP_KERNEL);
++	if (!c)
++		return;
++	c->hdmi = hdmi;
++	c->la = CEC_LOG_ADDR_INVALID;
++	c->irq = -1;
++	c->alive = true;
++	mutex_init(&c->lock);
++	INIT_DELAYED_WORK(&c->work, histb_cec_work);
++
++	id = histb_hdmi_readb(hdmi, HISTB_CEC_DEVICE_ID);
++	dev_info(hdmi->dev, "CEC block id %02x (expect %02x), spec %02x, rev %02x, line %s\n", id,
++		 HISTB_CEC_BLOCK_ID, histb_hdmi_readb(hdmi, HISTB_CEC_SPEC),
++		 histb_hdmi_readb(hdmi, HISTB_CEC_HARDWARE_REV),
++		 (histb_hdmi_readb(hdmi, HISTB_CEC_INT_STATUS_0) & HISTB_CEC_ST0_LINE) ? "high" : "LOW");
++	if (id != HISTB_CEC_BLOCK_ID)
++		dev_warn(hdmi->dev, "CEC block does not answer like the Silicon Image CPI; the adapter is registered anyway\n");
++
++	if (cec_irq) {
++		irq = platform_get_irq_byname_optional(pdev, "cec");
++		if (irq > 0 && !devm_request_irq(hdmi->dev, irq, histb_cec_irq, 0, "histb-hdmi-cec", c))
++			c->irq = irq;
++		else
++			dev_warn(hdmi->dev, "cec_irq=1 but SPI 147 was not available: polling only\n");
++	}
++
++	hdmi->cec = c;
++	hdmi->bridge.ops |= DRM_BRIDGE_OP_HDMI_CEC_ADAPTER;
++	hdmi->bridge.hdmi_cec_dev = hdmi->dev;
++	hdmi->bridge.hdmi_cec_adapter_name = dev_name(hdmi->dev);
++	hdmi->bridge.hdmi_cec_available_las = 1;
++}
++
++/* The TX reset (takeover of the link) cleared the CPI registers: put the enabled state back. */
++static void histb_hdmi_cec_restore(struct histb_hdmi *hdmi)
++{
++	struct histb_hdmi_cec *c = hdmi->cec;
++
++	if (!c)
++		return;
++	mutex_lock(&c->lock);
++	if (c->on) {
++		histb_cec_hw_enable(c);
++		c->tx_busy = false;	/* whatever was on the wire is gone */
++	}
++	mutex_unlock(&c->lock);
++}
++
++static void histb_hdmi_cec_remove(struct histb_hdmi *hdmi)
++{
++	struct histb_hdmi_cec *c = hdmi->cec;
++
++	if (!c)
++		return;
++	mutex_lock(&c->lock);
++	if (c->on)
++		histb_cec_hw_disable(c);
++	c->on = false;
++	c->alive = false;	/* from here every CEC op returns without touching hdmi->base */
++	mutex_unlock(&c->lock);
++	cancel_delayed_work_sync(&c->work);
++}
++
++#ifdef CONFIG_DEBUG_FS
++static int histb_hdmi_cec_show(struct seq_file *m, void *unused)
++{
++	struct histb_hdmi *hdmi = m->private;
++	struct histb_hdmi_cec *c = hdmi->cec;
++	static const struct { const char *name; u32 reg; } regs[] = {
++		{ "device_id", HISTB_CEC_DEVICE_ID }, { "spec", HISTB_CEC_SPEC },
++		{ "hw_rev", HISTB_CEC_HARDWARE_REV }, { "start_low_250us", HISTB_CEC_DEBUG_0 },
++		{ "start_bit_250us", HISTB_CEC_DEBUG_1 }, { "debug_3", HISTB_CEC_DEBUG_3 },
++		{ "config_cpi", HISTB_HDMI_CEC_CONFIG_CPI }, { "tx_init", HISTB_CEC_TX_INIT },
++		{ "tx_dest", HISTB_CEC_TX_DEST }, { "retry_limit", HISTB_CEC_RETRY_LIMIT },
++		{ "capture_id0", HISTB_CEC_CAPTURE_ID0 }, { "capture_id1", HISTB_CEC_CAPTURE_ID1 },
++		{ "int_enable_0", HISTB_CEC_INT_ENABLE_0 }, { "int_enable_1", HISTB_CEC_INT_ENABLE_1 },
++		{ "int_status_0", HISTB_CEC_INT_STATUS_0 }, { "int_status_1", HISTB_CEC_INT_STATUS_1 },
++		{ "rx_count", HISTB_CEC_RX_COUNT },
++	};
++	unsigned int i;
++
++	mutex_lock(&c->lock);
++	seq_printf(m, "on %d  la %u  tx_busy %d  irq %d  alive %d\n", c->on, c->la, c->tx_busy, c->irq, c->alive);
++	seq_printf(m, "line %s (status_0 bit 7: the CEC wire, high = idle)\n",
++		   (histb_hdmi_readb(hdmi, HISTB_CEC_INT_STATUS_0) & HISTB_CEC_ST0_LINE) ? "high" : "LOW");
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		seq_printf(m, "%-16s %02x\n", regs[i].name, histb_hdmi_readb(hdmi, regs[i].reg));
++	mutex_unlock(&c->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(histb_hdmi_cec);
++
++static void histb_hdmi_cec_debugfs(struct histb_hdmi *hdmi, struct dentry *dir)
++{
++	if (hdmi->cec)
++		debugfs_create_file("cec", 0444, dir, hdmi, &histb_hdmi_cec_fops);
++}
++#endif /* CONFIG_DEBUG_FS */
++
++#endif /* CONFIG_DRM_HISI_HISTB_HDMI_CEC */
++#endif /* HISTB_HDMI_CEC_H */

@@ -1,0 +1,22 @@
+LOCAL PATCH (not submitted anywhere): watchdog: sp805 — restart with a non-zero load
+
+HiSilicon Hi3798CV200 SP805 never expires from WDTLOAD = 0, so the restart handler hung reboot
+forever. Use 0x100, as the vendor kernel does.
+
+--- a/drivers/watchdog/sp805_wdt.c	2026-10-11 18:27:30
++++ b/drivers/watchdog/sp805_wdt.c	2026-10-11 18:27:30
+@@ -140,7 +140,13 @@
+ 
+ 	writel_relaxed(UNLOCK, wdt->base + WDTLOCK);
+ 	writel_relaxed(0, wdt->base + WDTCONTROL);
+-	writel_relaxed(0, wdt->base + WDTLOAD);
++	/*
++	 * LOCAL (HiMedia Q10 Pro / Hi3798CV200): HiSilicon's SP805 never expires from a LOAD of 0
++	 * — measured 2026-10-11: sysrq-b sat in this handler until an unrelated arming fired 190 s
++	 * later. The vendor kernel restarts with LOAD = 0x100 (mach-hi3798cv2x/core.c), i.e. two
++	 * expiries of 256 ticks; do the same.
++	 */
++	writel_relaxed(0x100, wdt->base + WDTLOAD);
+ 	writel_relaxed(INT_ENABLE | RESET_ENABLE, wdt->base + WDTCONTROL);
+ 
+ 	/* Flush posted writes. */

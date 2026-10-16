@@ -1,0 +1,17 @@
+#!/bin/sh
+# q10-swap — compressed RAM swap first (zram, prio 100), the SATA disk second (2 GB file, prio 10).
+# Paused Android's memory goes here: ~350 MB of it compressed to ~120 MB in zram (2026-10-12).
+set -u
+if ! grep -q zram0 /proc/swaps; then
+  [ "$(cat /sys/block/zram0/disksize)" = 0 ] && echo 1G > /sys/block/zram0/disksize
+  mkswap -q /dev/zram0 && swapon -p 100 /dev/zram0
+fi
+f=/var/swap.q10
+# Only where there is room for it AND 1 GB left over: on the 3.5 GB stick root a failed fallocate
+# left a 1.25 GB unusable file that filled the root to 0 bytes (2026-10-13). Never keep a partial.
+need=$((3 * 1024 * 1024))   # KiB: the 2 GB file + 1 GB headroom
+if [ ! -f $f ] && [ "$(df -Pk /var | awk 'NR==2 {print $4}')" -ge $need ]; then
+  { fallocate -l 2G $f && chmod 600 $f && mkswap -q $f; } || rm -f $f
+fi
+[ -f $f ] && ! grep -q "$f" /proc/swaps && swapon -p 10 $f
+cat /proc/swaps

@@ -1,0 +1,24 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: crg-hi3798cv200 - add the VO / VDP gates
+
+Mainline registers no clock object for the video output block, so the Hi3798CV200
+display processor could never name its gates.  Seven simple gates are added, ids
+90..96 (the community 6.12 tree numbers them 70..77 and 90, which collide with this
+tree's inner-clock window 64..89):
+
+  CRG 0xd8  (PERI_CRG54)  bit 0 vo_bus, bit 4 vo_hd, bit 31 vdp_cfg
+  CRG 0x34c               bit 0 vo_bp, bit 11 vdp_g0, bit 13 vdp_v0, bit 14 vdp_hd
+
+⛔ Registering a clock object that nothing consumes is not free: clk_disable_unused()
+closes every enabled, unclaimed gate at late_initcall.  The bootloader's boot logo is
+scanned out through exactly these gates, so with histb-vdp not loaded (it is a
+blacklisted module) a plain gate would blank the TV.  All gates the boot display depends
+on are therefore CLK_IS_CRITICAL, which keeps them open and changes no register (they
+are already set).  Only vdp_v0 - the video layer, unused by the boot logo - is an
+ordinary gate that histb-vdp enables when it needs it.
+
+The soft reset (CRG 0xd8 bit 30) is deliberately NOT exposed: histb-vdp adopts the
+running pipe and must never reset it.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain).
+Needs 0001..0010 first.
+

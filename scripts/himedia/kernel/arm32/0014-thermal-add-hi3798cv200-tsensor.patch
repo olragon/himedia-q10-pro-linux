@@ -1,0 +1,185 @@
+From: olragon <olragon@users.noreply.github.com>
+Subject: [PATCH] thermal: add the Hi3798CV200 on-die temperature sensor
+
+Read-only thermal zone driver for the PMC tsensor (control 0x72 as the stock kernel writes,
+SYSCTRL 0xf0 trim applied).
+---
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -263,6 +263,17 @@
+ 	  thermal framework. cpufreq is used as the cooling device to throttle
+ 	  CPUs when the passive trip is crossed.
+ 
++config HI3798CV200_THERMAL
++	tristate "Hi3798CV200 on-die temperature sensor"
++	depends on ARCH_HISI || COMPILE_TEST
++	depends on HAS_IOMEM
++	depends on OF
++	select MFD_SYSCON
++	help
++	  Read-only driver for the temperature sensor in the Hi3798CV200 PMC
++	  block.  It registers a thermal zone; trips and cooling come from
++	  the device tree.
++
+ config IMX_THERMAL
+ 	tristate "Temperature sensor driver for Freescale i.MX SoCs"
+ 	depends on ARCH_MXC || COMPILE_TEST
+--- a/drivers/thermal/Makefile
++++ b/drivers/thermal/Makefile
+@@ -60,6 +60,7 @@
+ obj-y				+= qcom/
+ obj-y				+= tegra/
+ obj-$(CONFIG_HISI_THERMAL)     += hisi_thermal.o
++obj-$(CONFIG_HI3798CV200_THERMAL)	+= hi3798cv200_thermal.o
+ obj-y				+= mediatek/
+ obj-$(CONFIG_GENERIC_ADC_THERMAL)	+= thermal-generic-adc.o
+ obj-$(CONFIG_UNIPHIER_THERMAL)	+= uniphier_thermal.o
+--- /dev/null
++++ b/drivers/thermal/hi3798cv200_thermal.c
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hi3798CV200 on-die temperature sensor (stage 1: read-only, no cooling).
++ *
++ * The sensor sits in the PMC block (PMC+0x28 control, PMC+0x30..0x3c eight 10-bit samples, two
++ * per register).  Sequence and conversion follow the stock 3.18 kernel's mpu_get_temperature
++ * (docs/261012-himedia-dvfs-research.md s6):
++ *
++ *   control <- 0x72 (start), read the eight samples, avg = sum / 8
++ *   T(C) = ((avg * 165 - 20625) / 2) / 403 - 40,  plus the SYSCTRL+0xf0 trim
++ *   trim: [21:18] magnitude in C, bit 22 = sign (1 = subtract)
++ *
++ * The community histb-linux-6.12.y driver writes 0x6005 and omits the trim; the stock kernel on
++ * this very board writes 0x72, so 0x72 is used.  The sensor is stopped (control 0) after each
++ * read, which is also the state it was found in at boot.
++ */
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/thermal.h>
++
++#define HI3798_TS_CTRL		0x00
++#define HI3798_TS_CTRL_START	0x72
++#define HI3798_TS_DATA(i)	(0x08 + (i) * 4)
++#define HI3798_TS_NUM_REGS	4
++#define HI3798_TS_NUM_SAMPLES	8
++#define HI3798_TS_SAMPLE_MASK	GENMASK(9, 0)
++#define HI3798_TS_CONV_WAIT_US	16000
++
++#define HI3798_SYSCTRL_TRIM	0xf0
++#define HI3798_TRIM_MAG_MASK	GENMASK(21, 18)
++#define HI3798_TRIM_NEG		BIT(22)
++
++struct hi3798_tsensor {
++	void __iomem *regs;
++	struct regmap *sysctrl;
++	struct mutex lock;
++};
++
++static int hi3798_tsensor_trim_mc(struct hi3798_tsensor *ts)
++{
++	unsigned int v;
++	int mag;
++
++	if (!ts->sysctrl || regmap_read(ts->sysctrl, HI3798_SYSCTRL_TRIM, &v))
++		return 0;
++
++	mag = FIELD_GET(HI3798_TRIM_MAG_MASK, v) * 1000;
++	return (v & HI3798_TRIM_NEG) ? -mag : mag;
++}
++
++static int hi3798_tsensor_get_temp(struct thermal_zone_device *tz, int *temp)
++{
++	struct hi3798_tsensor *ts = thermal_zone_device_priv(tz);
++	unsigned int sum = 0, avg, v;
++	s64 mc;
++	int i;
++
++	mutex_lock(&ts->lock);
++	writel(HI3798_TS_CTRL_START, ts->regs + HI3798_TS_CTRL);
++	usleep_range(HI3798_TS_CONV_WAIT_US, HI3798_TS_CONV_WAIT_US + 1000);
++
++	for (i = 0; i < HI3798_TS_NUM_REGS; i++) {
++		v = readl(ts->regs + HI3798_TS_DATA(i));
++		sum += FIELD_GET(HI3798_TS_SAMPLE_MASK, v);
++		sum += FIELD_GET(HI3798_TS_SAMPLE_MASK, v >> 16);
++	}
++	writel(0, ts->regs + HI3798_TS_CTRL);
++	mutex_unlock(&ts->lock);
++
++	avg = sum / HI3798_TS_NUM_SAMPLES;
++	/* A zero or saturated average is no reading: report it, never a made-up temperature. */
++	if (!avg || avg >= 1023)
++		return -EAGAIN;
++
++	mc = div_s64(((s64)avg * 165 - 20625) * 1000, 2 * 403) - 40000;
++	*temp = mc + hi3798_tsensor_trim_mc(ts);
++	return 0;
++}
++
++static const struct thermal_zone_device_ops hi3798_tsensor_ops = {
++	.get_temp = hi3798_tsensor_get_temp,
++};
++
++static int hi3798_tsensor_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct thermal_zone_device *tz;
++	struct hi3798_tsensor *ts;
++	int temp;
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++
++	ts->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(ts->regs))
++		return PTR_ERR(ts->regs);
++
++	/* Optional: without the trim register the reading is untrimmed, and the log says so. */
++	ts->sysctrl = syscon_regmap_lookup_by_phandle(dev->of_node,
++						      "hisilicon,sysctrl");
++	if (IS_ERR(ts->sysctrl)) {
++		dev_warn(dev, "no SYSCTRL trim register, readings are untrimmed\n");
++		ts->sysctrl = NULL;
++	}
++	mutex_init(&ts->lock);
++
++	tz = devm_thermal_of_zone_register(dev, 0, ts, &hi3798_tsensor_ops);
++	if (IS_ERR(tz))
++		return dev_err_probe(dev, PTR_ERR(tz), "thermal zone registration failed\n");
++
++	if (!hi3798_tsensor_get_temp(tz, &temp))
++		dev_info(dev, "SoC temperature %d.%03d C (trim %d mC)\n",
++			 temp / 1000, abs(temp % 1000),
++			 hi3798_tsensor_trim_mc(ts));
++	else
++		dev_warn(dev, "first reading invalid\n");
++
++	return 0;
++}
++
++static const struct of_device_id hi3798_tsensor_of_match[] = {
++	{ .compatible = "hisilicon,hi3798cv200-tsensor" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798_tsensor_of_match);
++
++static struct platform_driver hi3798_tsensor_driver = {
++	.probe = hi3798_tsensor_probe,
++	.driver = {
++		.name = "hi3798cv200-tsensor",
++		.of_match_table = hi3798_tsensor_of_match,
++	},
++};
++module_platform_driver(hi3798_tsensor_driver);
++
++MODULE_DESCRIPTION("Hi3798CV200 on-die temperature sensor");
++MODULE_LICENSE("GPL");

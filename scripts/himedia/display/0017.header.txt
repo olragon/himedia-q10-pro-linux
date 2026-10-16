@@ -1,0 +1,35 @@
+LOCAL PATCH (not submitted anywhere): drm: hisilicon: histb-vdp - mode setting through the HDMI bridge
+
+0011 adopts the bootloader's 1080p and never writes DHD0 timing.  This adds mode setting on top,
+without changing what a plain `modprobe histb_vdp` does.
+
+  * With an HDMI bridge in the device tree (ports: vdp port 0 -> hdmi port 0) the connector is made
+    from the bridge chain (drm_bridge_connector): EDID modes, HDR_OUTPUT_METADATA, Colorspace,
+    max bpc, infoframes.  The mode the bootloader started is put first and is the only PREFERRED
+    mode, so the console client's first commit is a commit for the mode already running.
+  * "The mode DHD0 already runs" is compared WITH the pixel clock (DRM_MODE_MATCH_CLOCK): 148.5 MHz 60.00 Hz and
+    the bootloader's 148.352 MHz 59.94 Hz share every timing and need different PLL plans.
+  * A commit for the mode DHD0 already runs does what it always did: NOTHING to the hardware.
+  * A commit for another mode (histb_vdp_mode.c):
+      1. retimes the HDMI pixel clock (clk_set_rate on the HPLL).  A PLL that does not lock has
+         already been rolled back by the clock driver; the commit then touches nothing else;
+      2. the FIRST time: VDP soft reset (CRG 0xd8 bit 30), AXI / low-power setup, the RGB identity
+         colour path and the G0 -> GP0 -> mixer route of the community driver.  The community
+         HDMI TX setup assumes that RGB chain and the bootloader runs a different one (hdmi_mode 0,
+         DHD0 colour conversion on), so VDP and TX are switched together;
+      3. every time: DHD0 interface off, HSYNC1/2 VSYNC PWR, GP0 size, interface on, the vblank
+         threshold line for the new height.
+    The plane updates the commit helpers run BEFORE crtc_enable are replayed afterwards (a reset
+    wipes them; V0 derives its VP0 size from the mode).
+  * allow_scale is unchanged.  New: modeset=0 (module parameter) or a device tree without ports
+    keeps the original fixed-mode connector; the VDP reset line and the "pixel" clock are optional.
+  * the boot mode's clock is taken from the running PLL, not assumed: the bootloader's "1080p60"
+    runs 148.352 MHz = 59.94 Hz, so the sink's 59.94 Hz mode is the one recognised as running.
+  * connector max bpc defaults to 8 (the pipe is 8 bit); the bridge's 12 only creates the HDR
+    property.
+  * rmmod after a mode change leaves the planes off (the bootloader's buffer and chain are gone).
+  * debugfs histb_vdp_regs prints the mode, owned and the pixel clock.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain), W=1.
+Needs 0011, 0012, 0015, 0016.
+

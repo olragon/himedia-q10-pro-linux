@@ -1,0 +1,841 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * DTS for the HiMedia Q10 Pro (HiSilicon Hi3798CV200) — 32-bit ARM (AArch32)
+ *
+ * ⚠️ UNTESTED ON HARDWARE. Every address, interrupt and clock below is taken from a
+ * primary source — the stock firmware's own device tree (extracted from boot.img), the
+ * Hi3798CV200 register map in the vendor BSP, and a live read-only recon of the box —
+ * but nothing here has been booted. Where a value is a guess it says so.
+ *
+ * ⭐ Why AArch32 rather than arm64: the stock bootloader is a 32-bit U-Boot and its `bootm`
+ * rejects a foreign architecture — the stock kernel uImage is `arch=2` (ARM). Replacing the
+ * loader would need DDR timing that is not published plus a serial console, so 32-bit is the
+ * only route that keeps the box closed. All four cores still come up, because the secure
+ * firmware provides PSCI (trustedcore exports hisi_psci_cpu_on/_off/_suspend and references
+ * bl31) and PSCI has an AArch32 SMC calling convention.
+ *
+ * Requires: 0001-clk-hisilicon-crg-hi3798cv200-add-SATA-clocks.patch
+ *           (mainline does not register the SATA clocks)
+ *           0002-phy-histb-combphy-allow-32-bit-arm.patch
+ *           (PHY_HISTB_COMBPHY is gated on ARM64; the driver itself is arch-neutral)
+ *           hi3798cv200.dtsi from scripts/himedia/kernel/arm32/ (generated)
+ *
+ * Bring-up order matters. First boot should prove serial + eMMC + Ethernet only; USB3 is
+ * therefore left disabled below, because an unverified PHY pairing that wedges the USB
+ * controller during probe would be indistinguishable from a kernel that failed to boot.
+ *
+ * ref: docs/261010-himedia-q10-pro-vendor-dtb.md
+ * ref: docs/261010-himedia-q10-pro-recon-findings.md
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
+#include "hi3798cv200.dtsi"
+
+/ {
+	model = "HiMedia Q10 Pro (AArch32)";
+	compatible = "himedia,q10-pro", "hisilicon,hi3798cv200";
+
+	aliases {
+		serial0 = &uart0;
+		serial2 = &uart2;
+	};
+
+	chosen {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* Confirmed from the stock cmdline: console=ttyAMA0,115200 */
+		stdout-path = "serial0:115200n8";
+
+		/*
+		 * ⭐ HDMI without a display driver: the stock fastboot leaves its boot-logo layer (VDP
+		 * G0) scanning out this buffer, and nothing in mainline turns the VDP off. MEASURED
+		 * with devmem on the running box (2026-10-11): G0_ADDR 0x7B68C000, G0_IRESO 1920x1080,
+		 * G0_STRIDE 0x1E0 x 16 B = 7680, ifmt 0x68 = ARGB8888. ⚠️ G0_CBMPARA has per-pixel
+		 * alpha ON (0x11FF) and fbcon draws with alpha 0, so userspace must clear palpha_en
+		 * (CBMPARA = 0x01FF, then G0_UPD bit 0) or the text is transparent.
+		 */
+		framebuffer@7b68c000 {
+			compatible = "simple-framebuffer";
+			reg = <0x7b68c000 0x7e9000>;
+			width = <1920>;
+			height = <1080>;
+			stride = <7680>;
+			format = "a8r8g8b8";
+		};
+	};
+
+	/*
+	 * ⭐ CORE NODES REALIGNED TO THE VENDOR'S OWN DEVICE TREE (from the eMMC dump).
+	 *
+	 * Found by diffing our converted tree against the vendor's working one — the clue was in
+	 * the backup, which had been sitting here the whole time.
+	 *
+	 * ⛔ 1. `clock-frequency` was MISSING. Under AArch64 the firmware programs CNTFRQ at EL3,
+	 *       which is why upstream Poplar omits it. We enter in AArch32 from a 32-bit U-Boot,
+	 *       and the vendor states 24 MHz explicitly — so that path evidently does NOT set
+	 *       CNTFRQ. Without it the kernel has no timekeeping and dies in early init, silently.
+	 * ⚠️ 2. `arm,armv7-timer` is the AArch32 spelling; `armv8-timer` is the arm64 one.
+	 * ⚠️ 3. The vendor uses LEVEL_HIGH with a 4-CPU mask (0xf04) and only the two physical
+	 *       PPIs. Ours used LEVEL_LOW and four PPIs, copied from the arm64 tree.
+	 */
+	timer {
+		compatible = "arm,armv7-timer";
+		interrupts = <1 13 0xf04>,
+			     <1 14 0xf04>;
+		clock-frequency = <24000000>;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/*
+		 * 2 GB. The stock cmdline reserves 56 MB for the vendor media zone
+		 * (mmz=ddr,0,0,56M) and boots with mem=1993M; mainline has no VPU driver,
+		 * so that reservation is not needed and the full 2 GB is given to Linux.
+		 */
+		reg = <0x0 0x80000000>;
+	};
+
+	/*
+	 * ⭐ The boot log, kept in RAM so ANDROID can read it back after a reset (Tim's idea,
+	 * 2026-10-10: "can via android, give us these boot log?"). pstore/ramoops streams the
+	 * console into this block live; a watchdog reset keeps DRAM powered; with the stick pulled
+	 * the box boots stock Android, whose own `himd.l` (vendor /dev/hi_mem) dumps physical RAM.
+	 *
+	 * ⛔ The address is MEASURED, not chosen: it is in the free tail of the vendor media zone
+	 * (MMZ "ddr" 0x77C00000-0x7B3FFFFF, highest allocation 0x7A582FFF behind the framebuffer).
+	 * Markers written at 0x7A800000..0x7B380000 all survived a reset + U-Boot + a full Android
+	 * boot. Not at 0x7B300000 itself — that held a byte-ramp that looks like a DDR-training write.
+	 *
+	 * Layout (fs/pstore/ram.c): 4 x 128 KiB panic/oops records, then the 512 KiB console zone
+	 * at 0x7A880000. mem-type 1 = unbuffered: a watchdog reset flushes no cache.
+	 * Decode with `bun run himedia:ramoops`.
+	 */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* The HDMI scan-out buffer above (1920 x 1080 x 4 = 0x7E9000): Linux must never reuse it. */
+		framebuffer@7b68c000 {
+			reg = <0x7b68c000 0x7e9000>;
+			no-map;
+		};
+
+		ramoops@7a800000 {
+			compatible = "ramoops";
+			reg = <0x7a800000 0x100000>;
+			console-size = <0x80000>;
+			record-size = <0x20000>;
+			mem-type = <1>;
+		};
+	};
+};
+
+/*
+ * SATA — the reason this box is worth converting.
+ *
+ * Confirmed: base 0xf9900000 (soc-relative 0x9900000) and IRQ 0x46 both appear in the
+ * stock device tree, and the stock tree also uses compatible "generic-ahci", so the
+ * mainline generic AHCI driver is the right one.
+ *
+ * The four clocks are PERI_CRG42 (CRG offset 0xa8) bits 0..3 and the four resets are
+ * bits 8..11 of the same register, per the Hi3798CV200 register map:
+ *   bit 0 sata_bus_cken        bit 8  sata_bus_srst_req
+ *   bit 1 sata_rx0_cken        bit 9  sata_cko_alive_srst_req
+ *   bit 2 sata_cko_alive_cken  bit 10 sata_rx0_srst_req
+ *   bit 3 sata_tx0_cken        bit 11 sata0_srst_req
+ */
+&soc {
+	/*
+	 * ⭐ The SP805 at 0xf8a2c000, bound to mainline's sp805_wdt for ONE reason: its restart
+	 * handler. Without it `reboot` (and panic=5) stops at "Restarting system" forever — the
+	 * vendor kernel restarts by arming this very watchdog (mach-hi3798cv2x/core.c), mainline
+	 * had no handler at all, and a box rebooted that way stayed dead (2026-10-11 16:17).
+	 * The kernel never feeds it (watchdog.handle_boot_enabled=0 in bootargs); probe reloads it
+	 * with timeout-sec = 150, the same window as init.sh's rootfs safety net (reset ~300 s).
+	 * Clock: 24 MHz — the rate every devmem arming in this repo already assumes.
+	 */
+	watchdog@8a2c000 {
+		compatible = "arm,sp805", "arm,primecell";
+		reg = <0x8a2c000 0x1000>;
+		/*
+		 * ⛔ HiSilicon's SP805 has ALL-ZERO PrimeCell ID registers (0xfe0..0xffc, read on the
+		 * box 2026-10-11), so the AMBA bus cannot identify it and defers forever ("deferred
+		 * probe pending"). Give the ID the driver matches: part 0x805, ARM, rev 1.
+		 */
+		arm,primecell-periphid = <0x00141805>;
+		clocks = <&crg HISTB_OSC_CLK>, <&crg HISTB_APB_CLK>;
+		clock-names = "wdog_clk", "apb_pclk";
+		timeout-sec = <150>;
+	};
+
+	sata: sata@9900000 {
+		compatible = "generic-ahci";
+		reg = <0x9900000 0x1000>;
+		interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_SATA_BUS_CLK>,
+			 <&crg HISTB_SATA_RX0_CLK>,
+			 <&crg HISTB_SATA_CKO_ALIVE_CLK>,
+			 <&crg HISTB_SATA_TX0_CLK>;
+		resets = <&crg 0xa8 8>,
+			 <&crg 0xa8 9>,
+			 <&crg 0xa8 10>,
+			 <&crg 0xa8 11>;
+		reset-names = "bus", "cko-alive", "rx0", "sata0";
+		phys = <&combphy1 PHY_TYPE_SATA>;
+		phy-names = "sata-phy";
+		/*
+		 * ⛔ DISABLED for bring-up, deliberately — this is a bisect, not a retreat.
+		 *
+		 * The kernel boots, configures eth0 from ip= (a late_initcall, so it definitely
+		 * ran) and then never execs init, while NOT panicking: steady 8/8 pings with
+		 * panic=5, so it is blocked rather than dying. A probe that never returns fits
+		 * exactly, and this node is the most suspect thing in the tree: it is new, its
+		 * four clocks were added by us, and no disk is attached for the link to train.
+		 *
+		 * ⚠️ There is also a known gap: the vendor's SATA clock driver pokes
+		 * PERI_CRG98_COMBPHY to 0xd00 for a 25 MHz VPLL, which we approximated with
+		 * assigned-clock-rates on COMBPHY1_CLK and never verified as equivalent.
+		 *
+		 * If init runs with this disabled, the SATA path is the hang and that register
+		 * write is the first thing to check.
+		 *
+		 * ⭐ ENABLED 2026-10-11: the kernel now boots to userspace reliably and a disk is in the
+		 * bay (Tim). Shipped as its own image AFTER the first ssh boot, so a hang here can only
+		 * mean SATA. Fallback: the previous uImage stays on the stick as uImage.ssh-ok.
+		 */
+		status = "okay";
+	};
+
+	/*
+	 * USB 3.0. Both controllers exist and both are live under the stock firmware.
+	 * This box's stock kernel binds the SuperSpeed port on xhci1 (f98b0000), but the
+	 * combo-PHY pairing is the open question — see the note under &combphy1 — so both
+	 * stay disabled until first boot succeeds without them.
+	 *
+	 * Needs no kernel patch: mainline already registers both instances' clocks
+	 * (the plain set for xhci0, the *_CLK1 set for xhci1) as gates on CRG 0xb0.
+	 */
+	xhci0: usb@98a0000 {
+		compatible = "hisilicon,hi3798cv200-xhci";
+		reg = <0x98a0000 0x10000>;
+		interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_USB3_BUS_CLK>,
+			 <&crg HISTB_USB3_UTMI_CLK>,
+			 <&crg HISTB_USB3_PIPE_CLK>,
+			 <&crg HISTB_USB3_SUSPEND_CLK>;
+		clock-names = "bus", "utmi", "pipe", "suspend";
+		resets = <&crg 0xb0 12>;
+		reset-names = "soft";
+		/*
+		 * Side USB3 socket (the only controller with a SuperSpeed lane: combphy0 is USB3-only).
+		 * ⭐ usb2_phy1_port0, NOT usb2_phy2_port0 (the old guess): the vendor's host0 init writes
+		 * PERI_USB0 (0x120) and releases USB2_PHY01_SRST_TREQ0 (CRG 0xbc bit 8) — vendor
+		 * clk-hiusb3.c; docs/261011-himedia-ports-wifi-smp-research.md §2.2.
+		 * ⛔ "phys-names" (sic) is what xhci-histb.c reads for its PHY quirks; keep both.
+		 * CRG 0xb0 on the running box = 0x007D0060: host0's unmodelled bus gates (bits 5,6) are
+		 * already on; only REF_CKEN0 (bit 1) is off, as REF_CKEN1 is for the working xhci1.
+		 */
+		phys = <&usb2_phy1_port0>, <&combphy0 PHY_TYPE_USB3>;
+		phy-names = "usb", "combo";
+		phys-names = "inno", "combo";
+		status = "okay";
+	};
+
+	xhci1: usb@98b0000 {
+		compatible = "hisilicon,hi3798cv200-xhci";
+		reg = <0x98b0000 0x10000>;
+		interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_USB3_BUS_CLK1>,
+			 <&crg HISTB_USB3_UTMI_CLK1>,
+			 <&crg HISTB_USB3_PIPE_CLK1>,
+			 <&crg HISTB_USB3_SUSPEND_CLK1>;
+		clock-names = "bus", "utmi", "pipe", "suspend";
+		/*
+		 * ⛔ MEASURED from the vendor's own bring-up of this controller ("usb3 host1",
+		 * drivers/hisilicon/clk/hi3798cv2x/clk-hiusb3.c hiclk_enable_usb3_host1):
+		 *   reset  = USB3_VCC_SRST_REQ1, CRG 0xb0 BIT 28 — the old guess here was bit 13;
+		 *   phy    = the ONE-port USB2 PHY (USB2_PHY2_SRST_REQ bit 6, _TREQ bit 10,
+		 *            inno_phy_config_1p) = usb2_phy2, not usb2_phy1 port 1.
+		 * Wrong PHY = the controller registers (ramoops log: bus 3/4, 1 port each) but its port
+		 * is never powered, so the onboard Genesys hub never enumerates. Android's working
+		 * CRG 0xb0 = 0x007f007f (all host1 clocks on, bit 28 clear) and 0xbc = 0x5 agree.
+		 */
+		resets = <&crg 0xb0 28>;
+		reset-names = "soft";
+		/*
+		 * ⚠️ Deliberately NO combo phy. combphy1 is taken by SATA above, and these
+		 * are the same lane — so this controller is USB 2.0 only once SATA is in use.
+		 * ⚠️ GUESS: both the usb2-phy pairing and reset bit 13 are unverified.
+		 */
+		phys = <&usb2_phy2_port0>;
+		phy-names = "inno";
+		/*
+		 * ⛔ "phys-names" is NOT a typo here — it is what xhci-histb.c reads
+		 * (of_property_match_string(np, "phys-names", "inno")) to switch the inno USB2 PHY
+		 * interface to UTMI 8-bit/no-ULPI. Standard `phy-names` never triggers it.
+		 */
+		phys-names = "inno";
+		/*
+		 * ⭐ ENABLED, MEASURED: the boot stick ("USB DISK 3.0" 13fe:6300) sits on THIS controller,
+		 * behind an onboard Genesys 05e3:0608 4-port hub (himedia:android-probe, 2026-10-10).
+		 * ⚠️ Clocks are mainline's HISTB_USB3_*_CLK1; the vendor clocks this instance with its
+		 * USB2 clock (0xbc). If the controller is unclocked a register read can stall the bus —
+		 * that would read as a kernel regression (~3:30), not a silent failure.
+		 */
+		status = "okay";
+	};
+};
+
+/*
+ * combphy1 carries SATA.
+ *
+ * The mux is already upstream — hi3798cv200.dtsi declares
+ * `hisilicon,mode-select-bits = <0x0008 11 (0x3 << 11)>`, which is exactly the vendor's
+ * PERI_CTRL offset 0x8 with BIT(11)|BIT(12), encoding 00=PCIe, 01=USB3, 10=SATA. So only
+ * the clock rate needs changing: the vendor's SATA path runs this PHY from the 25 MHz
+ * VPLL, while the dtsi default is 100 MHz.
+ *
+ * The combphy1 clock's parent is a mux over {100m, 25m} with CLK_SET_RATE_PARENT, so
+ * asking for 25 MHz here selects the 25 MHz parent. (The reference port instead points
+ * assigned-clock-parents at driver-private clock ids 0x50/0x42, which are not part of the
+ * published binding — this form avoids depending on those.)
+ *
+ * ⛔ Taking this lane for SATA costs the second USB3 controller its SuperSpeed capability.
+ *    That is a hardware constraint, not a configuration choice.
+ */
+&combphy1 {
+	assigned-clocks = <&crg HISTB_COMBPHY1_CLK>;
+	assigned-clock-rates = <25000000>;
+};
+
+/* eMMC — 16 GB, non-removable, 8-bit. */
+&emmc {
+	/*
+	 * ⚠️ NO pinctrl. Poplar points at a board pinctrl file that does not exist for this
+	 * box, so the pads are left as the bootloader muxed them. eMMC is the device the
+	 * bootloader itself just read the kernel from, so it is the safest case for this
+	 * assumption — but it IS an assumption, and a first boot that cannot find a root
+	 * device should suspect it.
+	 */
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	non-removable;
+	status = "okay";
+};
+
+/*
+ * WiFi: AP6255 (BCM43455c0) on SDIO1. The stock bcmdhd logged WL_REG_ON = -1 (no GPIO: the
+ * module enable is tied or follows the controller's PWREN) and ran on the in-band SDIO IRQ,
+ * so neither a pwrseq nor an out-of-band interrupt is described. First bring-up at SD
+ * high-speed 50 MHz: the plain dw-mshc glue has no tuning, so no SDR104 yet (vendor ran 100 MHz).
+ * Firmware: /lib/firmware/brcm/brcmfmac43455-sdio.{bin,himedia,q10-pro.txt,clm_blob}.
+ */
+&sdio1 {
+	bus-width = <4>;
+	max-frequency = <50000000>;
+	non-removable;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	disable-wp;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	wifi@1 {
+		compatible = "brcm,bcm4329-fmac";
+		reg = <1>;
+	};
+};
+
+/* SD card slot (the box has one on the side). */
+&sd0 {
+	bus-width = <4>;
+	cap-sd-highspeed;
+	status = "okay";
+};
+
+/*
+ * Gigabit Ethernet. The stock kernel binds f9841000.ethernet, i.e. gmac1 — not gmac0 —
+ * and the stock device tree gives phy-mode "rgmii" — but its PHY address is wrong (see below).
+ */
+&gmac1 {
+	phy-handle = <&phy1>;
+	phy-mode = "rgmii-id";
+	/*
+	 * ⛔ Mainline does not read this board's MAC, and the address below is SOURCED, not
+	 * copied from a running system: it is ASCII text at offset 0 of the `deviceinfo`
+	 * partition in the eMMC backup, beside the serial (HMDB501805000639) and the HDCP
+	 * key blob at DRMAddr=0x4000. A plain-text vendor blob at a fixed offset in a
+	 * proprietary partition is not an nvmem cell any upstream driver knows how to read,
+	 * so pinning it here is the correct and only fix.
+	 *
+	 * ⛔ RETRACTED: this comment used to say "measured on the first successful boot: the
+	 * kernel came up as 02:00:00:00:55:01 (a Sigmastar OUI)". That is FALSE. There has
+	 * never been a successful boot, and 02:00:00:00:55:01 is the IP CAMERA at
+	 * 192.168.1.55 — verified against `arp -an` on 2026-10-10, byte for byte. It was the
+	 * same camera that cost five build-and-boot rounds. Do not read it as evidence that
+	 * the mainline gmac driver assigns a random address; nothing here was ever measured
+	 * from this board under mainline.
+	 * ref: docs/261010-himedia-backup-forensics-and-boot-scenarios.md
+	 */
+	local-mac-address = [00 66 de 0e fe b7];
+	/*
+	 * ⛔ The PHY must be a DIRECT child of the gmac node — no `mdio {}` wrapper.
+	 * hix5hd2_gmac registers its MDIO bus on the gmac node itself
+	 * (`of_mdiobus_register(bus, dev->of_node)`) and of_mdio scans direct children only, so a
+	 * wrapper has no `reg`, is skipped, the PHY is never registered and open() fails. This
+	 * is how the box booted through every initcall and still never appeared on the LAN.
+	 * Poplar (`&gmac1 { phy@3 }`) and the vendor arm32 tree (`higmac1 { ethernet_phy@1 {
+	 * reg = <3>; } }`) both use this shape.
+	 */
+	#address-cells = <1>;
+	#size-cells = <0>;
+	/*
+	 * ⛔ Required once the "phy" reset resolves (RESET_TI_SYSCON=y): the driver then reads
+	 * this property and fails probe with `goto out_disable_clk` if it is absent.
+	 * Order: pre, pulse, post-deassert, in microseconds.
+	 *
+	 * ⭐ The VENDOR's timing for this SoC, not Poplar's. higmac/board.c holds the PHY in reset
+	 * for 20 ms and waits 50 ms before any MDIO access ("delay some time to ensure later MDIO
+	 * access"); Poplar's 10/30 ms gave verdict DOWN (2:05, 2026-10-10) — eth0 registered but
+	 * open() could not attach the PHY. Post-deassert doubled again for margin; a longer wait
+	 * cannot hurt a PHY, a shorter one can leave it silent on MDIO.
+	 */
+	hisilicon,phy-reset-delays-us = <10000 20000 100000>;
+	status = "okay";
+
+	/*
+	 * ⛔ MDIO ADDRESS 1, MEASURED — not 3. The stock vendor kernel registers this board's PHY
+	 * as `f9841000.etherne:01`, id 0x001cc915 (Realtek RTL8211E), link Up 1Gbps/Full
+	 * (himedia:android-probe, 2026-10-10). The vendor DT says `reg = <0x03>` on a node it names
+	 * `ethernet_phy@1`; we copied the 3, the MDIO scan found nothing there, phy_connect failed
+	 * and eth0 stayed DOWN (FAST verdict, 2:05). Poplar's 3 was never this board's number.
+	 *
+	 * ⭐ phy-mode "rgmii-id" — MEASURED live on 2026-10-11 (q10-mii + 10 router pings per
+	 * setting): the RTL8211E's strap pins select BOTH clock delays (ext 0xa4/0x1c straps 10/10,
+	 * both-forced 10/10, either alone 0/10, none 0/10). Plain "rgmii" makes mainline's
+	 * rtl8211e_config_init force them OFF, which is what kept RX at 0 on 2026-10-10.
+	 * hix5hd2 accepts rgmii-id only with patch 0003. docs/261011-himedia-ssh-rootfs.md
+	 */
+	phy1: ethernet-phy@1 {
+		reg = <1>;
+	};
+};
+
+/*
+ * ⭐ USB 2.0 host, so PID 1 can write the kernel log to the boot stick. The stock U-Boot loads
+ * our uImage through EHCI ("USB EHCI %x.%02x" in fastboot.img), so this controller pair is the
+ * one already proven to see this stick. Poplar enables exactly these two, nothing more.
+ * xHCI stays disabled: its usb2-phy pairing is still a guess.
+ */
+/*
+ * ⛔ RETRACTED (2026-10-10): this gave EHCI/OHCI both usb2_phy1 ports. It changed nothing, and
+ * the android-probe showed why — the stick is on xHCI f98b0000, behind an onboard Genesys hub;
+ * EHCI has nothing attached in the vendor kernel. Port 1 belongs to xhci1 below, alone.
+ * Original note, kept for the record: BOTH usb2_phy1 ports, not just port 0 as Poplar has it. The vendor's host-controller init
+ * for this SoC (drivers/hisilicon/clk/hi3798cv2x/clk-hiusb2.c) holds and then cancels the reset
+ * of PHY port **1** (USB2_PHY01_SRST_TREQ1, CRG 0xbc bit 9) — port 0 is the OTG-muxed one. With
+ * only port 0 listed, nothing ever took port 1 out of reset: root hubs registered, no device in
+ * 30 s (NO_STICK twice, 2026-10-10). usb_phy_roothub_alloc() inits and powers every phandle in
+ * `phys`, so listing both is the whole fix. xhci1 also names port 1 but stays disabled.
+ */
+/*
+ * ⛔ The comment above said "listing port 1 is the whole fix" but these overrides never set it,
+ * so EHCI/OHCI kept the dtsi's port 0 (now xhci0's) and PHY port 1 stayed in reset
+ * (CRG 0xbc = 0x205 vs Android's 0x005). That port is the SIDE USB2 socket: releasing bit 9 by
+ * hand enumerated a Logitech keyboard/trackpad receiver on OHCI at once (2026-10-12, Tim plugged it).
+ */
+&ohci {
+	phys = <&usb2_phy1_port1>;
+	status = "okay";
+};
+
+&ehci {
+	phys = <&usb2_phy1_port1>;
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&ir {
+	status = "okay";
+};
+
+/*
+ * ⛔ PCIe stays DISABLED. It is the third option on combphy1's mux, so enabling it would
+ * contend with SATA — and the recon found no PCIe device on this board anyway
+ * (/sys/bus/pci/devices/ is empty; the Wi-Fi module is SDIO on mmc2).
+ */
+
+/*
+ * ⛔ PSCI REMOVED — the vendor device tree has no psci node whatsoever, and its kernel brings
+ * all four cores up through BSP code that is not in mainline. That is evidence this firmware
+ * may not expose PSCI to an AArch32 non-secure world, despite `trustedcore` containing
+ * hisi_psci_* symbols (which the TEE may use internally rather than export via SMC).
+ *
+ * A psci node that cannot be serviced makes the kernel issue SMC calls into nothing during
+ * early CPU setup, which hangs with no output. Dropping it costs SMP — the box comes up
+ * single-core — which is an acceptable price for a first boot. Re-add it afterwards to see
+ * whether the other three cores can be brought online.
+ */
+/delete-node/ &{/psci};
+
+/*
+ * ⭐ SMP the vendor way (patch 0005): SRAM boot stub at 0xffff0000 + CRG core resets, no PSCI.
+ * docs/261011-himedia-ports-wifi-smp-research.md §4.
+ */
+&{/cpus/cpu@0} { enable-method = "hisilicon,hi3798cv200-smp"; };
+&{/cpus/cpu@1} { enable-method = "hisilicon,hi3798cv200-smp"; };
+&{/cpus/cpu@2} { enable-method = "hisilicon,hi3798cv200-smp"; };
+&{/cpus/cpu@3} { enable-method = "hisilicon,hi3798cv200-smp"; };
+
+/*
+ * ⭐ Hardware video decode (VDEC + VPSS), patches 0008/0009 — from vdec-dt-snippet.dtsi
+ * (parts A + B; part C, the dedicated pool, is skipped for bring-up: cma=128M in bootargs).
+ * Drivers are MODULES: nothing here probes until `modprobe histb-vdec`.
+ */
+&soc {
+	/*
+	 * VDH video decoder + SCD (stream code detector) + BPD (bit-plane
+	 * decoder, VC-1) + VDH MMU.  One register window: the driver programs
+	 * all four from this single mapping (vendor sysconfig.h: VDM 0xf8c30000,
+	 * SCD 0xf8c3c000, BPD 0xf8c3d000, MMU at +0xf000).
+	 */
+	vdec: video-codec@8c30000 {
+		/* Matched by histb-vdec; see the binding added by 0008. */
+		compatible = "hisilicon,hi3798cv200-vdec";
+
+		/* Soc-relative 0x8c30000 = physical 0xf8c30000, 64 KiB. [read] */
+		reg = <0x8c30000 0x10000>;
+
+		/*
+		 * Three SPIs, GIC numbers (the vendor numbers are these minus 32):
+		 *   vdh = 95   decode-done / error of the pixel engine
+		 *   scd = 104  stream code detector
+		 *   mmu = 149  VDH MMU fault (non-secure)
+		 * The driver requests "vdh" only (platform_get_irq_byname) and reads
+		 * the SCD/MMU status registers from that handler; "scd" and "mmu" are
+		 * required by the binding but not requested. [read] histb-vdec-core.c
+		 */
+		interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "vdh", "scd", "mmu";
+
+		/*
+		 * Gates from patch 0009: CRG 0x78 bit 0, CRG 0x78 bit 1, CRG 0x88
+		 * bit 0.  The driver also writes the VDH clock-select field
+		 * (CRG 0x78 bits [9:8]) itself through the crg regmap, so these
+		 * gates have no rate parent.
+		 */
+		clocks = <&crg HISTB_VDH_CLK>,
+			 <&crg HISTB_VDH_DSP_CLK>,
+			 <&crg HISTB_BPD_CLK>;
+		clock-names = "vdh", "dsp", "bpd";
+
+		/*
+		 * crg reset cells are <register-offset bit> in OUR dtsi
+		 * (#reset-cells = <2>), as in the community tree:
+		 *   vdh = CRG 0x78 bit 4   decode engine
+		 *   scd = CRG 0x78 bit 5   stream code detector
+		 *   mfd = CRG 0x78 bit 6   main format decoding engine
+		 *   bpd = CRG 0x88 bit 4   bit-plane decoder
+		 * The driver also pulses the same bits by hand through the crg
+		 * regmap for a full pipeline reset and waits for the ack in
+		 * CRG 0x174 (HISTB_CRG_RESET_STATUS). [read]
+		 */
+		resets = <&crg 0x78 4>, <&crg 0x78 5>,
+			 <&crg 0x78 6>, <&crg 0x88 4>;
+		reset-names = "vdh", "scd", "mfd", "bpd";
+
+		/*
+		 * Mandatory: the tile -> linear step lives in the VPSS and the
+		 * decoder takes a reference on it (histb_vpss_get()).  Probe
+		 * defers until the vpss device is bound.
+		 */
+		hisilicon,vpss = <&vpss>;
+
+		/*
+		 * No `iommus`: the VDH MMU stays in bypass for every codec in this
+		 * port (only the removed AVS path used it).  The driver also does
+		 * syscon_regmap_lookup_by_compatible("hisilicon,hi3798cv200-crg"),
+		 * which our crg node already satisfies ("hisilicon,hi3798cv200-crg",
+		 * "syscon", "simple-mfd") - nothing to add.
+		 *
+		 * `memory-region = <&vdec_pool>;` is added by PART C if wanted.
+		 */
+		status = "disabled";
+	};
+
+	/*
+	 * VPSS: converts the decoder's native tile surfaces to linear NV12/P010
+	 * (the only way the CAPTURE queue can be linear), does ZME scaling and
+	 * field-rate deinterlace.  It has no /dev node of its own.
+	 */
+	vpss: video-post-processing@8cb0000 {
+		compatible = "hisilicon,hi3798cv200-vpss";
+
+		/* Soc-relative 0x8cb0000 = physical 0xf8cb0000, 64 KiB. [read] */
+		reg = <0x8cb0000 0x10000>;
+
+		/* GIC SPI 93, level high. [read] */
+		interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+
+		/*
+		 * Gate in CRG 0xf0 bit 0, fed by vpss_mux (CRG 0xf0 bits [9:8] ->
+		 * 333 / 400 / 300 MHz).  Both come from patch 0009.
+		 */
+		clocks = <&crg HISTB_VPSS_CLK>;
+		clock-names = "core";
+
+		/* CRG 0xf0 bit 4. [read] */
+		resets = <&crg 0xf0 4>;
+		reset-names = "core";
+
+		status = "disabled";
+	};
+};
+
+/* ======================================================================== */
+/* PART B: board dts - switch both on                                       */
+/* ======================================================================== */
+
+&vpss {
+	status = "okay";
+};
+
+&vdec {
+	/* memory-region = <&vdec_pool>;   <- PART C, optional */
+	status = "okay";
+};
+
+/*
+ * ⭐ GPU: Mali-T720 for Panfrost (patch 0010: GPU clock, HISTB_GPU_CLK = 61) — from
+ * gpu-dt-snippet.dtsi. panfrost is BLACKLISTED on the rootfs until proven (q10-untested.conf).
+ */
+/ {
+	/*
+	 * Placeholder supply for panfrost's mandatory "mali" regulator lookup.
+	 *
+	 * The SoC can drive a core-voltage PWM at 0xf8a23020 (the community tree
+	 * has a driver for it, "hisilicon,hi3798cv200-gpu-regulator"), but a
+	 * retail box is under no obligation to wire that PWM to a DC-DC; the
+	 * Q10 Pro's wiring is NOT known. [inferred]  Writing a PWM duty to a
+	 * rail that is not connected does nothing, and writing one to a rail
+	 * that IS connected can under- or over-volt the core.  So: no
+	 * controllable regulator, no voltage changes (stage 1 also had no OPP
+	 * table; stage 2 adds a frequency-only one, below).  The GPU
+	 * runs at whatever voltage the stock bootloader left on the core rail.
+	 *
+	 * DVFS STAGE 2 (docs/261012-himedia-dvfs-stage2.md): the voltage IS known now.  Read on the
+	 * box at boot: PMC+0x20 = 0x006D00C9 = 880 mV, which is the vendor's voltage for every GPU
+	 * rate 200..500 MHz (600 needs 920, 675 needs 980: NOT in the table).  So this fixed supply
+	 * says 880 mV, the OPPs below say 880 mV, and the OPP core's "set 880 mV" is a no-op.  The
+	 * core rail (shared with video/display) is never written.
+	 */
+	vdd_gpu: regulator-vdd-gpu {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd-gpu";
+		regulator-min-microvolt = <880000>;
+		regulator-max-microvolt = <880000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * GPU OPPs: frequency only, 200..500 MHz, all at 880 mV (vendor gpu@f9200000 table, research
+	 * s4.2).  The clock (patch 0010) accepts exactly these rates plus 600/675, which are left out.
+	 * panfrost registers devfreq with simple_ondemand; /sys/class/devfreq/f9200000.gpu/.
+	 * Fallback: delete the operating-points-v2 line of &gpu and panfrost stays at 200 MHz.
+	 */
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp-200000000 {
+			opp-hz = /bits/ 64 <200000000>;
+			opp-microvolt = <880000>;
+		};
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <880000>;
+		};
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <880000>;
+		};
+		/*
+		 * No 500 MHz: the vendor lists it at 880 mV, but on this box it hung the GPU under a
+		 * Chromium WebGL load twice on fresh boots (gpu sched timeouts + js faults, 2026-10-12),
+		 * while 400 MHz ran the same 60 s load clean at 59.9 fps (vsync-capped; 200 MHz = 40 fps).
+		 */
+	};
+};
+
+&soc {
+	/*
+	 * Mali-T720, 16 KiB register window at physical 0xf9200000.  Soc-relative
+	 * like every other node here (soc ranges = <0x0 0xf0000000 0x10000000>).
+	 *
+	 * WHY INSIDE &soc (the community tree put it at the TOP level):
+	 * there the soc node carries a 1 GiB dma-ranges, so the Mali was moved
+	 * out to inherit the unrestricted root window.  Our soc node already
+	 * has a 2 GiB dma-ranges (<0x0 0x0 0x80000000>) that covers all of RAM
+	 * (mem=1993M, top 0x7c900000), so no buffer the GPU can be handed is
+	 * out of its reach and the workaround is unnecessary.  Staying in &soc
+	 * keeps the one-bus-one-window rule and the soc-relative addressing of
+	 * vdec/vpss.  Panfrost's MMU is LPAE with a 40-bit mask, which the
+	 * 2 GiB window narrows to 31 bits via the bus limit - fine. [inferred]
+	 * If RAM ever grows past 2 GiB, widen the soc dma-ranges, not this node.
+	 *
+	 * NOT dma-coherent: the T720 has no ACE-Lite port. [inferred]
+	 */
+	gpu: gpu@9200000 {
+		compatible = "arm,mali-t720";
+		reg = <0x9200000 0x4000>;
+		/* GIC SPI numbers (physical IRQ = SPI + 32). [read] community dtsi */
+		interrupts = <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 141 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 143 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "job", "mmu", "gpu";
+
+		/*
+		 * Patch 0010.  The clock owns gate AND soft reset (CRG 0xd4
+		 * bits 0 and 4), so there is deliberately NO `resets` here:
+		 * a second owner of bit 4 could leave the GPU held in reset
+		 * behind the clock's back.  The community tree lists
+		 * `resets = <&crg 0xd4 4>` as well; with our 0010 that is
+		 * harmless but redundant. [inferred]
+		 */
+		clocks = <&crg HISTB_GPU_CLK>;
+		clock-names = "core";
+
+		mali-supply = <&vdd_gpu>;
+		operating-points-v2 = <&gpu_opp>;
+
+		/*
+		 * Bring-up: leave the rate at the clock's safe default (200 MHz,
+		 * the vendor's index 0).  Once the driver is stable, uncomment to
+		 * pin 400 MHz - the highest point that needs no voltage change in
+		 * the vendor table (opp 200..500 MHz are all 880 mV; 600 and
+		 * 675 MHz need more). [read] community dvbip.dtsi OPP table.
+		 * Valid rates: 200/300/400/500/600/675 MHz.
+		 */
+		/* assigned-clocks = <&crg HISTB_GPU_CLK>; */
+		/* assigned-clock-rates = <400000000>; */
+
+		status = "disabled";
+	};
+};
+
+/* ======================================================================== */
+/* PART B: board dts - switch it on                                         */
+/* ======================================================================== */
+
+&gpu {
+	status = "okay";
+};
+
+/*
+ * ⭐ VDP display controller + HDMI transmitter (patches 0011/0012, 0015-0017).
+ * Both are modules (histb-vdp, histb-hdmi), blacklisted on the rootfs; loading histb-vdp evicts
+ * simpledrm (no return until reboot) and pulls histb-hdmi in first.
+ *
+ * What loading does to the hardware: NOTHING.  histb-vdp adopts the mode DHD0 is running and
+ * histb-hdmi leaves the transmitter alone.  The `resets` below are only ACQUIRED at load; the VDP
+ * reset (CRG 0xd8 bit 30) and the HDMI bus/core/phy resets are pulsed once, by the first atomic
+ * commit that asks for a mode other than the bootloader's 1080p.
+ *
+ * `pixel` is the HDMI pixel clock (HPLL, clk-hi3798cv200-hdmi.c): histb-vdp sets its RATE
+ * (it is never enabled by the VDP), histb-hdmi owns its gate.  Remove the `ports` links, or load
+ * histb-vdp with modeset=0, and the old fixed-mode connector comes back.
+ */
+&soc {
+	vdp: display-controller@8cc0000 {
+		compatible = "hisilicon,hi3798cv200-vdp";
+		reg = <0x8cc0000 0x10000>;
+		interrupts = <GIC_SPI 90 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_VO_BUS_CLK>,
+			 <&crg HISTB_VO_HD_CLK>,
+			 <&crg HISTB_VDP_CFG_CLK>,
+			 <&crg HISTB_VDP_HD_CLK>,
+			 <&crg HISTB_VDP_G0_CLK>,
+			 <&crg HISTB_VDP_V0_CLK>,
+			 <&crg HISTB_VO_BP_CLK>,
+			 <&crg HISTB_HDMI_PIXEL_CLK>;
+		clock-names = "bus", "hd", "config", "core", "graphics", "video", "bp", "pixel";
+		resets = <&crg 0xd8 30>;
+		reset-names = "vdp";
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				vdp_hd0_out: endpoint {
+					remote-endpoint = <&hdmi_in>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * Silicon Image "imagev200" TX core + HiSilicon PHY at 0xf8ce0000 (not DesignWare).
+	 * hisilicon,hpd-poll: hot-plug by polling the TX every 100 ms instead of taking SPI 88 -
+	 * the interrupt polarity is only programmed by the vendor init, which probe does not run.
+	 */
+	hdmi: hdmi@8ce0000 {
+		compatible = "hisilicon,hi3798cv200-hdmi";
+		reg = <0x8ce0000 0x20000>;
+		interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "cec";
+		clocks = <&crg HISTB_HDMI_BUS_CLK>,
+			 <&crg HISTB_HDMI_CEC_CLK>,
+			 <&crg HISTB_HDMI_ID_CLK>,
+			 <&crg HISTB_HDMI_MHL_CLK>,
+			 <&crg HISTB_HDMI_OS_CLK>,
+			 <&crg HISTB_HDMI_AS_CLK>,
+			 <&crg HISTB_HDMI_X_CLK>,
+			 <&crg HISTB_HDMI_PIXEL_NX_CLK>,
+			 <&crg HISTB_HDMI_PIXEL_CLK>;
+		clock-names = "bus", "cec", "id", "mhl", "os", "as", "x",
+			      "pixel-nx", "pixel";
+		resets = <&crg 0x10c 8>, <&crg 0x10c 9>, <&crg 0x110 4>;
+		reset-names = "bus", "core", "phy";
+		hisilicon,perictrl = <&perictrl 0x8b0>;
+		hisilicon,hpd-poll;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				hdmi_in: endpoint {
+					remote-endpoint = <&vdp_hd0_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				hdmi_out: endpoint {
+				};
+			};
+		};
+	};
+};

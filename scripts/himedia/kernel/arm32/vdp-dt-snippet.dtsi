@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device-tree node for the Hi3798CV200 video display processor (VDP), for OUR
+ * AArch32 tree.  Driver: histb-vdp (patch 0011), clocks: patch 0012.
+ *
+ * Source: community 6.12 hi3798cv200.dtsi, node display-controller@8cc0000
+ * (register window, SPI 90, clock set).  Tags: [read] = taken from that file or
+ * the vendor SDK, [inferred] = reasoned, [measured] = seen on the box.  Nothing
+ * here has run on hardware.
+ *
+ * Differences from the community node, on purpose:
+ *  - NO `resets`.  The community driver soft-resets the VDP (CRG 0xd8 bit 30)
+ *    and re-programs the whole pipe; this driver ADOPTS the bootloader's
+ *    running 1080p60 pipe and must never reset it (a reset blanks the TV and
+ *    the HDMI link has to be retrained by a driver we do not have).
+ *  - NO `ports`.  There is no HDMI TX driver to bridge to; the connector is
+ *    internal and reports the adopted mode.
+ *  - `clocks` come from patch 0012 (CRG 0xd8 / 0x34c gates).  All but
+ *    `video` (V0) are CLK_IS_CRITICAL there, so registering them cannot make
+ *    clk_disable_unused() gate the display the bootloader started.
+ *
+ * Needs, in this order: 0001..0010 (as today), 0011 (driver), 0012 (clocks).
+ * Add PART A to hi3798cv200.dtsi inside the soc node (or keep the `&soc`
+ * form in the board dts) and PART B to the board dts.  Compile-tested together
+ * with our dtsi + dts.
+ *
+ * The module is meant to be BLACKLISTED on the rootfs until proven
+ * (q10-untested.conf) and loaded by hand under the SP805 watchdog:
+ * status = "okay" only creates the platform device; nothing happens at boot.
+ */
+
+/* ======================================================================== */
+/* PART A: the node                                                         */
+/* ======================================================================== */
+
+&soc {
+	/*
+	 * 64 KiB register window at physical 0xf8cc0000 (soc-relative 0x8cc0000):
+	 * V0 0x0800, VP0 0x6000, G0 0x7000, GP0 0x8000, mixers 0xb000, DHD0 0xc000.
+	 * [read] VT vdp_define.h:83, hi_reg_vdp.h
+	 */
+	vdp: display-controller@8cc0000 {
+		compatible = "hisilicon,hi3798cv200-vdp";
+		reg = <0x8cc0000 0x10000>;
+
+		/* DHD0 vertical-threshold interrupt, GIC SPI 90. [read] community dtsi */
+		interrupts = <GIC_SPI 90 IRQ_TYPE_LEVEL_HIGH>;
+
+		/*
+		 * CRG 0xd8: bit 0 vo_bus, bit 4 vo_hd, bit 31 vdp_cfg.
+		 * CRG 0x34c: bit 0 vo_bp, bit 11 vdp_g0, bit 13 vdp_v0, bit 14 vdp_hd.
+		 * [read] community crg-hi3798cv200.c:1719-1737, VT hi_reg_crg.h
+		 */
+		clocks = <&crg HISTB_VO_BUS_CLK>,
+			 <&crg HISTB_VO_HD_CLK>,
+			 <&crg HISTB_VDP_CFG_CLK>,
+			 <&crg HISTB_VDP_HD_CLK>,
+			 <&crg HISTB_VDP_G0_CLK>,
+			 <&crg HISTB_VDP_V0_CLK>,
+			 <&crg HISTB_VO_BP_CLK>;
+		clock-names = "bus", "hd", "config", "core", "graphics", "video", "bp";
+
+		status = "disabled";
+	};
+};
+
+/* ======================================================================== */
+/* PART B: board dts - switch it on                                         */
+/* ======================================================================== */
+
+&vdp {
+	status = "okay";
+};
+
+/* ======================================================================== */
+/* Reserved memory: nothing to add.                                         */
+/* ======================================================================== */
+
+/*
+ * The boot framebuffer (reserved-memory framebuffer@7b68c000, 0x7e9000 bytes,
+ * no-map) stays exactly as it is: simpledrm is evicted by an aperture handoff
+ * over that address range, the memory is never released or reused, and the
+ * driver restores G0 to it when it is unbound.
+ *
+ * Scanout buffers for the primary plane come from the DRM CMA helpers; the
+ * video plane scans out the decoder's own CMA capture buffers (PRIME import),
+ * so the 128 MiB default CMA from vdec-dt-snippet.dtsi PART C is shared by
+ * decoder + fbdev console + dumb buffers.
+ */

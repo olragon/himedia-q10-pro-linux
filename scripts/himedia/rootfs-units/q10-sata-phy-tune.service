@@ -1,0 +1,18 @@
+# Q10: SATA PHY tuning at the start of boot when the INITRAMFS already loaded ahci_platform (root on
+# the SATA disk). The initramfs loads the driver with mainline's combphy tuning (nano[1]=0x8), which
+# leaves the link marginal, so tune + retrain before the rest of boot hammers the root disk.
+# The k14 initramfs lives in the stick's uImage, which is never rewritten — hence userspace.
+# docs/261014-himedia-sata-kernel-vs-board.md
+[Unit]
+Description=Q10: SATA PHY tuning (driver loaded by the initramfs)
+DefaultDependencies=no
+ConditionPathExists=/sys/module/ahci_platform
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/q10-sata-phy-tune
+
+[Install]
+WantedBy=sysinit.target

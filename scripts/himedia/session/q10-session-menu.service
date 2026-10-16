@@ -1,0 +1,9 @@
+# Q10: the TV menu on demand (hotkey, `systemctl start q10-session-menu`, or a session that quit by itself).
+[Unit]
+Description=Q10: session menu
+After=q10-video-stack.service
+Wants=q10-video-stack.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/q10-mode menu

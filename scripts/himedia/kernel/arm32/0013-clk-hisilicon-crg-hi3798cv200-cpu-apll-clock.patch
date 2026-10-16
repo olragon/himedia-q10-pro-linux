@@ -1,0 +1,485 @@
+From: olragon <olragon@users.noreply.github.com>
+Subject: [PATCH] clk: hisilicon: crg-hi3798cv200: add the CPU (APLL) clock
+
+Settable CPU clock for cpufreq-dt: new feedback divider through the APLL tune block
+(CRG 0x1a4..0x1b4), result read back from CRG 0x294.  Ported from the community
+histb-linux-6.12.y tree (79347a39f) with exact rates (396/600/798/1200/1596 MHz),
+no rate above the boot rate, and a refusal to retune from an unknown starting point.
+Frequency only: no voltage is touched.
+---
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -11,7 +11,9 @@
+ #include <linux/clk-provider.h>
+ #include <linux/delay.h>
+ #include <linux/iopoll.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/spinlock.h>
+@@ -47,6 +49,29 @@
+ #define HI3798CV200_FIXED_333M			88
+ #define HI3798CV200_VPSS_MUX			89
+ 
++#define HI3798CV200_CPU_PLL_CFG0		0x0
++#define HI3798CV200_CPU_PLL_CFG1		0x4
++#define HI3798CV200_CPU_CLK_CTRL		0x48
++#define HI3798CV200_CPU_CLK_SEL_MASK	GENMASK(2, 0)
++#define HI3798CV200_CPU_PLL_POSTDIV1_MASK GENMASK(26, 24)
++#define HI3798CV200_CPU_PLL_POSTDIV2_MASK GENMASK(30, 28)
++#define HI3798CV200_CPU_PLL_FBDIV_MASK	GENMASK(11, 0)
++#define HI3798CV200_CPU_PLL_REFDIV_MASK	GENMASK(17, 12)
++#define HI3798CV200_APLL_TUNE_INT	0x1a4
++#define HI3798CV200_APLL_TUNE_FRAC	0x1a8
++#define HI3798CV200_APLL_TUNE_STEP_INT	0x1ac
++#define HI3798CV200_APLL_TUNE_STEP_FRAC	0x1b0
++#define HI3798CV200_APLL_TUNE_CTRL	0x1b4
++#define HI3798CV200_APLL_TUNE_INT_MASK	GENMASK(11, 0)
++#define HI3798CV200_APLL_TUNE_FRAC_MASK	GENMASK(23, 0)
++#define HI3798CV200_APLL_TUNE_STEP_INT_MASK GENMASK(11, 0)
++#define HI3798CV200_APLL_TUNE_STEP_FRAC_MASK GENMASK(23, 0)
++#define HI3798CV200_APLL_TUNE_MODE	BIT(2)
++#define HI3798CV200_APLL_TUNE_ENABLE	BIT(3)
++#define HI3798CV200_APLL_TUNE_STATUS	0x294
++#define HI3798CV200_APLL_TUNE_RESULT_MASK GENMASK(11, 0)
++#define HI3798CV200_APLL_TUNE_BUSY	BIT(13)
++#define HI3798CV200_CPU_PLL_REF_RATE	24000000UL
+ #define HI3798CV200_CRG_NR_CLKS			128
+ 
+ static const struct hisi_fixed_rate_clock hi3798cv200_fixed_rate_clks[] = {
+@@ -469,6 +494,406 @@
+ 		return ret;
+ 
+ 	clk_data->clk_data.clks[HISTB_GPU_CLK] = gpu->hw.clk;
++	return 0;
++}
++
++/*
++ * CPU clock (stage 1: frequency only).  Ported from the community histb-linux-6.12.y tree
++ * (commit 79347a39f, crg-hi3798cv200.c hi3798cv200_cpu_clk), cross-checked against the stock
++ * 3.18 kernel's mpu_clk_set_rate (docs/261012-himedia-dvfs-research.md s2.2).
++ *
++ * The APLL registers 0x00/0x04 are never written.  A change writes the new feedback divider into
++ * the "tune" block (0x1a4..0x1b4) and waits for CRG 0x294 to report it: rate = 24 MHz * fbdiv /
++ * (refdiv * postdiv1 * postdiv2); on this board postdiv 2*1, refdiv 2, so rate = 6 MHz * fbdiv.
++ *
++ * Differences from the community driver:
++ *  - the table holds the rates the divider really produces (396/798/1596, not 400/800/1600), and a
++ *    rate is accepted only when fbdiv gives it exactly (no 10 MHz tolerance);
++ *  - nothing above the boot rate (1596 MHz) is ever accepted;
++ *  - a change is refused unless the rate read back at boot is itself in the table, so a board
++ *    with a different U-Boot setting is never retuned from an unknown starting point.
++ * Voltage is NOT touched: every OPP runs at the boot voltage (stage 1).
++ */
++#define HI3798CV200_CPU_MAX_FAILURES	3
++
++struct hi3798cv200_cpu_clk {
++	struct clk_hw hw;
++	void __iomem *base;
++	struct device *dev;
++	/* Serializes the shared APLL tuning transaction. */
++	struct mutex lock;
++	/* Latched when a rollback failed or HI3798CV200_CPU_MAX_FAILURES transitions failed in a row. */
++	bool rate_fault;
++	unsigned int failures;
++};
++
++static const unsigned long hi3798cv200_cpu_rates[] = {
++	396000000,
++	600000000,
++	798000000,
++	1200000000,
++	1596000000,
++};
++
++#define HI3798CV200_APLL_POLL_DELAY_US	10
++#define HI3798CV200_APLL_IDLE_TIMEOUT_US	1000
++#define HI3798CV200_APLL_TUNE_TIMEOUT_US	100000
++
++#define to_hi3798cv200_cpu_clk(_hw) \
++	container_of(_hw, struct hi3798cv200_cpu_clk, hw)
++
++static int hi3798cv200_cpu_pll_dividers(struct hi3798cv200_cpu_clk *cpu,
++					u32 *postdiv1, u32 *postdiv2,
++					u32 *refdiv)
++{
++	u32 cfg0 = readl_relaxed(cpu->base + HI3798CV200_CPU_PLL_CFG0);
++	u32 cfg1 = readl_relaxed(cpu->base + HI3798CV200_CPU_PLL_CFG1);
++
++	*postdiv1 = FIELD_GET(HI3798CV200_CPU_PLL_POSTDIV1_MASK, cfg0);
++	*postdiv2 = FIELD_GET(HI3798CV200_CPU_PLL_POSTDIV2_MASK, cfg0);
++	*refdiv = FIELD_GET(HI3798CV200_CPU_PLL_REFDIV_MASK, cfg1);
++
++	return *postdiv1 && *postdiv2 && *refdiv ? 0 : -EINVAL;
++}
++
++static unsigned long
++hi3798cv200_cpu_rate_from_fbdiv(struct hi3798cv200_cpu_clk *cpu, u32 fbdiv)
++{
++	u32 postdiv1, postdiv2, refdiv;
++
++	if (!fbdiv ||
++	    hi3798cv200_cpu_pll_dividers(cpu, &postdiv1, &postdiv2, &refdiv))
++		return 0;
++
++	return div64_u64((u64)fbdiv * HI3798CV200_CPU_PLL_REF_RATE,
++			 (u64)postdiv1 * postdiv2 * refdiv);
++}
++
++static bool hi3798cv200_cpu_rate_supported(unsigned long rate)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798cv200_cpu_rates); i++)
++		if (hi3798cv200_cpu_rates[i] == rate)
++			return true;
++	return false;
++}
++
++/* The live divider: CRG 0x294 once a tune has run, else the boot value in APLL cfg1. */
++static int hi3798cv200_cpu_apll_snapshot(struct hi3798cv200_cpu_clk *cpu,
++					 u32 *fbdiv, unsigned long *rate)
++{
++	u32 status;
++
++	status = readl_relaxed(cpu->base + HI3798CV200_APLL_TUNE_STATUS);
++	if (status & HI3798CV200_APLL_TUNE_BUSY)
++		return -EBUSY;
++
++	*fbdiv = FIELD_GET(HI3798CV200_APLL_TUNE_RESULT_MASK, status);
++	if (!*fbdiv)
++		*fbdiv = FIELD_GET(HI3798CV200_CPU_PLL_FBDIV_MASK,
++				   readl_relaxed(cpu->base +
++						 HI3798CV200_CPU_PLL_CFG1));
++
++	*rate = hi3798cv200_cpu_rate_from_fbdiv(cpu, *fbdiv);
++	return *rate ? 0 : -EINVAL;
++}
++
++static int hi3798cv200_cpu_apll_update_bits(struct hi3798cv200_cpu_clk *cpu,
++					    u32 offset, u32 mask, u32 value)
++{
++	u32 reg;
++
++	if (value & ~mask)
++		return -EINVAL;
++
++	reg = readl_relaxed(cpu->base + offset);
++	reg = (reg & ~mask) | value;
++	writel(reg, cpu->base + offset);
++
++	/* The same-device read drains the posted write and verifies its image. */
++	if (readl(cpu->base + offset) != reg)
++		return -EIO;
++
++	return 0;
++}
++
++static int hi3798cv200_cpu_apll_tune(struct hi3798cv200_cpu_clk *cpu,
++				     u32 fbdiv, u32 *last_status)
++{
++	const u32 ctl_mask = HI3798CV200_APLL_TUNE_MODE |
++			     HI3798CV200_APLL_TUNE_ENABLE;
++	u32 ctrl, status = 0;
++	int ret;
++
++	ret = readl_poll_timeout(cpu->base + HI3798CV200_APLL_TUNE_STATUS,
++				 status, !(status & HI3798CV200_APLL_TUNE_BUSY),
++				 HI3798CV200_APLL_POLL_DELAY_US,
++				 HI3798CV200_APLL_IDLE_TIMEOUT_US);
++	if (ret)
++		goto out_status;
++
++	ctrl = readl_relaxed(cpu->base + HI3798CV200_APLL_TUNE_CTRL) & ctl_mask;
++
++	/* Keep configuration fields inert while their new image is assembled. */
++	ret = hi3798cv200_cpu_apll_update_bits(cpu, HI3798CV200_APLL_TUNE_CTRL,
++					       ctl_mask,
++					       HI3798CV200_APLL_TUNE_MODE);
++	if (ret)
++		goto out_status;
++
++	ret = hi3798cv200_cpu_apll_update_bits(
++		cpu, HI3798CV200_APLL_TUNE_INT, HI3798CV200_APLL_TUNE_INT_MASK,
++		FIELD_PREP(HI3798CV200_APLL_TUNE_INT_MASK, fbdiv));
++	if (ret)
++		goto out_status;
++
++	ret = hi3798cv200_cpu_apll_update_bits(
++		cpu, HI3798CV200_APLL_TUNE_FRAC,
++		HI3798CV200_APLL_TUNE_FRAC_MASK, 0);
++	if (ret)
++		goto out_status;
++
++	ret = hi3798cv200_cpu_apll_update_bits(
++		cpu, HI3798CV200_APLL_TUNE_STEP_INT,
++		HI3798CV200_APLL_TUNE_STEP_INT_MASK,
++		FIELD_PREP(HI3798CV200_APLL_TUNE_STEP_INT_MASK, 1));
++	if (ret)
++		goto out_status;
++
++	ret = hi3798cv200_cpu_apll_update_bits(
++		cpu, HI3798CV200_APLL_TUNE_STEP_FRAC,
++		HI3798CV200_APLL_TUNE_STEP_FRAC_MASK, 0);
++	if (ret)
++		goto out_status;
++
++	/* All verified configuration writes must reach the CRG before tune_en. */
++	wmb();
++	ret = hi3798cv200_cpu_apll_update_bits(cpu, HI3798CV200_APLL_TUNE_CTRL,
++					       ctl_mask, ctl_mask);
++	if (ret)
++		goto out_status;
++
++	ret = readl_poll_timeout(cpu->base + HI3798CV200_APLL_TUNE_STATUS,
++				 status,
++				 !(status & HI3798CV200_APLL_TUNE_BUSY) &&
++				 FIELD_GET(HI3798CV200_APLL_TUNE_RESULT_MASK,
++					   status) == fbdiv,
++				 HI3798CV200_APLL_POLL_DELAY_US,
++				 HI3798CV200_APLL_TUNE_TIMEOUT_US);
++	if (ret) {
++		/* Cancel a timed-out request before the caller attempts a rollback. */
++		hi3798cv200_cpu_apll_update_bits(cpu, HI3798CV200_APLL_TUNE_CTRL,
++						 ctl_mask, ctrl);
++		readl_poll_timeout(cpu->base + HI3798CV200_APLL_TUNE_STATUS,
++				   status,
++				   !(status & HI3798CV200_APLL_TUNE_BUSY),
++				   HI3798CV200_APLL_POLL_DELAY_US,
++				   HI3798CV200_APLL_IDLE_TIMEOUT_US);
++	}
++
++out_status:
++	if (last_status)
++		*last_status = status;
++
++	return ret;
++}
++
++static unsigned long hi3798cv200_cpu_clk_recalc_rate(struct clk_hw *hw,
++						     unsigned long parent_rate)
++{
++	struct hi3798cv200_cpu_clk *cpu = to_hi3798cv200_cpu_clk(hw);
++	unsigned long rate;
++	u32 fbdiv;
++
++	/* Selector 0 = the APLL; 1..7 are the fixed sources (200/800/1350/24/1200/400/600). */
++	switch (readl_relaxed(cpu->base + HI3798CV200_CPU_CLK_CTRL) &
++		HI3798CV200_CPU_CLK_SEL_MASK) {
++	case 0:
++		break;
++	case 1:
++		return 200000000;
++	case 2:
++		return 800000000;
++	case 3:
++		return 1350000000;
++	case 4:
++		return 24000000;
++	case 5:
++		return 1200000000;
++	case 6:
++		return 400000000;
++	case 7:
++		return 600000000;
++	}
++
++	if (hi3798cv200_cpu_apll_snapshot(cpu, &fbdiv, &rate))
++		return 0;
++
++	return rate;
++}
++
++static int hi3798cv200_cpu_clk_determine_rate(struct clk_hw *hw,
++					      struct clk_rate_request *req)
++{
++	unsigned long best = hi3798cv200_cpu_rates[0];
++	unsigned long best_delta = ULONG_MAX;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798cv200_cpu_rates); i++) {
++		unsigned long delta = abs_diff(hi3798cv200_cpu_rates[i],
++					       req->rate);
++
++		if (delta < best_delta) {
++			best_delta = delta;
++			best = hi3798cv200_cpu_rates[i];
++		}
++	}
++
++	req->rate = best;
++	return 0;
++}
++
++static int hi3798cv200_cpu_clk_set_rate(struct clk_hw *hw, unsigned long rate,
++					unsigned long parent_rate)
++{
++	struct hi3798cv200_cpu_clk *cpu = to_hi3798cv200_cpu_clk(hw);
++	u32 fbdiv, old_fbdiv, postdiv1, postdiv2, refdiv, status = 0;
++	unsigned long actual, old_rate, rollback_rate;
++	u64 divisor;
++	int ret, rollback_ret;
++
++	if (!hi3798cv200_cpu_rate_supported(rate))
++		return -EINVAL;
++
++	if (hi3798cv200_cpu_pll_dividers(cpu, &postdiv1, &postdiv2, &refdiv))
++		return -EINVAL;
++
++	divisor = (u64)postdiv1 * postdiv2 * refdiv;
++	fbdiv = div64_u64((u64)rate * divisor, HI3798CV200_CPU_PLL_REF_RATE);
++	if (!fbdiv || fbdiv > FIELD_MAX(HI3798CV200_CPU_PLL_FBDIV_MASK))
++		return -EINVAL;
++
++	/* Exact only: the divider must produce the requested rate, not something near it. */
++	actual = div64_u64((u64)fbdiv * HI3798CV200_CPU_PLL_REF_RATE, divisor);
++	if (actual != rate)
++		return -EINVAL;
++
++	mutex_lock(&cpu->lock);
++	if ((readl_relaxed(cpu->base + HI3798CV200_CPU_CLK_CTRL) &
++	     HI3798CV200_CPU_CLK_SEL_MASK) != 0) {
++		ret = -EOPNOTSUPP;
++		goto unlock;
++	}
++
++	/*
++	 * A previous tune may still be settling (schedutil retunes back to back): wait for it
++	 * rather than latch a permanent fault on a transient busy bit.  Nothing is touched here.
++	 */
++	ret = readl_poll_timeout(cpu->base + HI3798CV200_APLL_TUNE_STATUS, status,
++				 !(status & HI3798CV200_APLL_TUNE_BUSY),
++				 HI3798CV200_APLL_POLL_DELAY_US,
++				 HI3798CV200_APLL_TUNE_TIMEOUT_US);
++	if (ret) {
++		dev_err_ratelimited(cpu->dev,
++				    "CPU APLL still busy before %lu Hz transition (status=%08x), not retuning\n",
++				    rate, status);
++		goto unlock;
++	}
++
++	ret = hi3798cv200_cpu_apll_snapshot(cpu, &old_fbdiv, &old_rate);
++	if (ret)
++		goto latch_fault;
++
++	if (old_rate == rate) {
++		ret = 0;
++		goto unlock;
++	}
++
++	/* Never retune from a starting point that is not one of our OPPs. */
++	if (!hi3798cv200_cpu_rate_supported(old_rate)) {
++		ret = -EOPNOTSUPP;
++		goto unlock;
++	}
++
++	if (cpu->rate_fault) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ret = hi3798cv200_cpu_apll_tune(cpu, fbdiv, &status);
++	if (!ret) {
++		u32 got;
++
++		ret = hi3798cv200_cpu_apll_snapshot(cpu, &got, &actual);
++		if (!ret && actual == rate) {
++			cpu->failures = 0;
++			goto unlock;
++		}
++		if (!ret)
++			ret = -EIO;
++	}
++
++	rollback_ret = hi3798cv200_cpu_apll_tune(cpu, old_fbdiv, &status);
++	if (!rollback_ret) {
++		rollback_ret = hi3798cv200_cpu_apll_snapshot(cpu, &old_fbdiv,
++							     &rollback_rate);
++		if (!rollback_ret && rollback_rate != old_rate)
++			rollback_ret = -EIO;
++	}
++
++	/* Back on a known OPP: retry is safe.  Latch only if the rollback failed or it keeps failing. */
++	if (rollback_ret || ++cpu->failures >= HI3798CV200_CPU_MAX_FAILURES)
++		WRITE_ONCE(cpu->rate_fault, true);
++	dev_err_ratelimited(cpu->dev,
++			    "CPU APLL %lu Hz transition failed: %d, rollback %s, %s (status=%08x)\n",
++			    rate, ret, rollback_ret ? "failed" : "succeeded",
++			    READ_ONCE(cpu->rate_fault) ? "LATCHED until reboot" : "will retry",
++			    status);
++	goto unlock;
++
++latch_fault:
++	WRITE_ONCE(cpu->rate_fault, true);
++	dev_err_ratelimited(cpu->dev,
++			    "CPU APLL was busy before %lu Hz transition (status=%08x)\n",
++			    rate,
++			    readl_relaxed(cpu->base + HI3798CV200_APLL_TUNE_STATUS));
++unlock:
++	mutex_unlock(&cpu->lock);
++	return ret;
++}
++
++static const struct clk_ops hi3798cv200_cpu_clk_ops = {
++	.recalc_rate = hi3798cv200_cpu_clk_recalc_rate,
++	.determine_rate = hi3798cv200_cpu_clk_determine_rate,
++	.set_rate = hi3798cv200_cpu_clk_set_rate,
++};
++
++static int hi3798cv200_cpu_clk_register(struct platform_device *pdev,
++					struct hisi_clock_data *clk_data)
++{
++	struct hi3798cv200_cpu_clk *cpu;
++	struct clk_init_data init = {
++		.name = "clk_cpu",
++		.ops = &hi3798cv200_cpu_clk_ops,
++		.flags = CLK_GET_RATE_NOCACHE,
++	};
++	int ret;
++
++	cpu = devm_kzalloc(&pdev->dev, sizeof(*cpu), GFP_KERNEL);
++	if (!cpu)
++		return -ENOMEM;
++
++	cpu->base = clk_data->base;
++	cpu->dev = &pdev->dev;
++	cpu->hw.init = &init;
++	mutex_init(&cpu->lock);
++
++	ret = devm_clk_hw_register(&pdev->dev, &cpu->hw);
++	if (ret)
++		return ret;
++
++	clk_data->clk_data.clks[HISTB_CPU_CLK] = cpu->hw.clk;
+ 	return 0;
+ }
+ 
+@@ -512,6 +937,10 @@
+ 	if (ret)
+ 		goto unregister_gate;
+ 
++	ret = hi3798cv200_cpu_clk_register(pdev, clk_data);
++	if (ret)
++		goto unregister_gate;
++
+ 	ret = of_clk_add_provider(pdev->dev.of_node,
+ 			of_clk_src_onecell_get, &clk_data->clk_data);
+ 	if (ret)
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -103,6 +103,13 @@
+ #define HISTB_VDP_V0_CLK		95
+ #define HISTB_VO_BP_CLK			96
+ 
++/*
++ * CPU clock: the APLL feedback divider, tuned through CRG 0x1a4..0x1b4 and read back
++ * from 0x294.  The community 6.12 tree numbers it 88, inside our inner-clock window
++ * (64..89); it takes the next free public id here.
++ */
++#define HISTB_CPU_CLK			97
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2

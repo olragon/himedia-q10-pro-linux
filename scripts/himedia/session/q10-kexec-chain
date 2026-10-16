@@ -1,0 +1,52 @@
+#!/bin/sh
+# q10-kexec-chain — boot stage 1. A cold boot always runs the stick's kernel (k14: it is the
+# fallback and is never rewritten), so this hands over to the kernel named in
+# /etc/q10/kernel.conf by kexec, early, before any session starts.
+#   q10-kexec-chain            (boot, from q10-kexec-chain.service)
+#   q10-kexec-chain status     show target, attempts, last result
+#   q10-kexec-chain reset      clear a recorded failure (try the target again next boot)
+# ⛔ A failure counter makes a loop impossible: `attempts` is written BEFORE the kexec and only
+# the chained kernel removes it (q10-kexec-chain-ok.service, once multi-user is up). A target that
+# hangs -> the SP805 resets the box -> U-Boot -> k14 -> sees attempts -> stays on k14.
+# docs/261012-himedia-dual-boot-android.md
+set -u
+CONF=/etc/q10/kernel.conf; LOG=/var/log/q10/kexec-chain.log
+# ⛔ The attempt counter lives ON THE STICK, not on the root. Stage 1 runs from the stick root, but the
+# chained kernel may mount a DIFFERENT root (the SATA disk): with the counter in /var/lib on each root,
+# the chained kernel cleared its own copy and stage 1 kept seeing "attempts=1" — every second boot
+# stayed on k14 (2026-10-14). Both roots mount the stick at /mnt/stick, so both see one counter.
+ST=/mnt/stick/q10-kexec-chain
+mkdir -p /var/log/q10
+log() { echo "[$(date +%F' '%T)] $*" | tee -a "$LOG"; echo "q10-kexec-chain: $*" > /dev/kmsg 2>/dev/null; }
+mountpoint -q /mnt/stick || { log "⛔ /mnt/stick not mounted — no shared chain state; staying on $(uname -r)"; exit 0; }
+mkdir -p "$ST"
+# ok: the chained kernel came up. Decided by the cmdline stage 1 handed over, NOT by this root's
+# kernel.conf — the SATA root has its own (older) copy of that file.
+if [ "${1:-}" = ok ]; then
+  grep -q 'q10.chained=1' /proc/cmdline && { rm -f "$ST/attempts" "$ST/failed"; log "chained kernel $(uname -r) is up — attempts cleared"; }
+  exit 0
+fi
+[ -f "$CONF" ] || { log "no $CONF — staying on $(uname -r)"; exit 0; }
+. "$CONF"   # TARGET_RELEASE, KDIR (zImage, dtb, cmdline), WATCHDOG (s, <=178)
+case "${1:-}" in
+  status) echo "running=$(uname -r) target=$TARGET_RELEASE attempts=$(cat $ST/attempts 2>/dev/null || echo 0)"
+          tail -5 "$LOG" 2>/dev/null; exit 0 ;;
+  reset)  rm -f "$ST/attempts"; log "reset: next boot tries $TARGET_RELEASE again"; exit 0 ;;
+esac
+[ "$(uname -r)" = "$TARGET_RELEASE" ] && { log "already on $TARGET_RELEASE"; exit 0; }
+if [ -s "$ST/attempts" ]; then
+  log "⛔ last chain into $TARGET_RELEASE did not come up (attempts=$(cat $ST/attempts)) — staying on $(uname -r). 'q10-kexec-chain reset' to retry"
+  echo "$TARGET_RELEASE" > "$ST/failed"; exit 0
+fi
+for f in zImage dtb cmdline; do [ -s "$KDIR/$f" ] || { log "⛔ missing $KDIR/$f — staying"; exit 0; }; done
+[ -d "/lib/modules/$TARGET_RELEASE" ] || { log "⛔ no /lib/modules/$TARGET_RELEASE — staying"; exit 0; }
+W=${WATCHDOG:-150}; [ "$W" -ge 30 ] && [ "$W" -le 178 ] || W=150
+# --image-size: see kexec-try.sh — keeps the DTB clear of the decompressor's self-relocation.
+kexec -l "$KDIR/zImage" --dtb="$KDIR/dtb" --image-size=0x6000000 \
+  --command-line="$(cat "$KDIR/cmdline") q10.chained=1" || { log "⛔ kexec -l failed — staying"; exit 0; }
+echo 1 > "$ST/attempts"; rm -f "$ST/failed"; sync
+BB=/bin/busybox
+$BB devmem 0xf8a2cc00 32 0x1acce551; $BB devmem 0xf8a2c000 32 $((W * 24000000))
+$BB devmem 0xf8a2c008 32 3; $BB devmem 0xf8a2cc00 32 1
+log "kexec $(uname -r) -> $TARGET_RELEASE, SP805 armed ${W}s"
+systemctl kexec

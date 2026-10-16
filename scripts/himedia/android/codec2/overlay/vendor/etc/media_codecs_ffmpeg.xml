@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- DRAFT, never run on a device (docs/261012-himedia-android-hw-video.md).
+     The Waydroid vendor image's /vendor/etc/media_codecs.xml already has
+     <Include href="media_codecs_ffmpeg.xml" /> (read from the 20260927 MAINLINE image) but ships
+     no such file on arm, so dropping this one into the overlay needs NO edit of media_codecs.xml.
+     Component names must match kFFMPEGVideoComponents in the service (c2.ffmpeg.*). -->
+<MediaCodecs>
+    <Decoders>
+        <MediaCodec name="c2.ffmpeg.h264.decoder" type="video/avc">
+            <Limit name="size" min="2x2" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.ffmpeg.hevc.decoder" type="video/hevc">
+            <Limit name="size" min="2x2" max="4096x2304" />
+            <Limit name="alignment" value="2x2" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.ffmpeg.vp9.decoder" type="video/x-vnd.on2.vp9">
+            <Limit name="size" min="2x2" max="4096x2304" />
+            <Limit name="alignment" value="2x2" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.ffmpeg.vp8.decoder" type="video/x-vnd.on2.vp8">
+            <Limit name="size" min="2x2" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+        <MediaCodec name="c2.ffmpeg.mpeg2.decoder" type="video/mpeg2">
+            <Limit name="size" min="2x2" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+    </Decoders>
+</MediaCodecs>

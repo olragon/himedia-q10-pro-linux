@@ -1,0 +1,314 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: crg-hi3798cv200 - add the Mali-T720 GPU clock
+
+Panfrost drives the Hi3798CV200 Mali-T720 once it has a clock, but mainline's
+CRG registers none for it.  The GPU needs one clock object that spans three
+core-CRG registers:
+
+  CRG 0xd4   bit 0 clock gate, bit 4 soft reset (1 = asserted)
+  CRG 0x124  [2:0] rate selector, bit 9 bypass, bit 10 switch request
+  CRG 0x154  [7:5] selector the hardware is actually running (read-only)
+
+Six rates exist: 200/300/400/500/600/675 MHz (selectors 7,4,1,6,3,5).  The
+sequences follow the vendor 4.4 SDK clk-higpu.c: enable opens the gate with
+reset asserted, releases the reset, then programs the selector and polls 0x154
+until it agrees; set_rate re-programs and polls the same way.
+
+Differences from the community 6.12 implementation, on purpose:
+ - enable() RELEASES the soft reset.  The community version sets bit 4 and
+   never clears it, which leaves the reset asserted unless something else
+   (the reset controller, in the right order) clears it again.  Here the clock
+   owns the whole pulse, so the device tree needs no "resets" entry.
+ - enable() fails closed: if 0x154 does not confirm the selector within 1 ms
+   the gate is closed again and -ETIMEDOUT is returned, so panfrost fails to
+   probe instead of running at an unverified rate.
+ - no rate_fault state machine and no sleeping mutex: every register sequence
+   is short, runs under one spinlock and polls atomically, so enable() is legal
+   under the clk enable lock.  The selector to program is remembered, so a
+   rate chosen before the first enable (assigned-clock-rates) survives it.
+ - determine_rate instead of the deprecated round_rate; the regulator/OPP
+   ordering the community driver documents is not needed because this tree
+   has no GPU voltage control.
+
+HISTB_GPU_CLK is 61.  The community tree uses 54, which in this tree is
+HISTB_SATA_TX0_CLK (patch 0001); 55-56 are SDIO1 (0006), 57-60 VDEC/VPSS
+(0009).  CRG_NR_CLKS is 128 and the driver-private ids start at 64, so 61 is
+inside the public range.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie
+cross toolchain), multi_v7-derived .config.
+
+diff --git a/drivers/clk/hisilicon/crg-hi3798cv200.c b/drivers/clk/hisilicon/crg-hi3798cv200.c
+index 273fd89f8..56c4dbbf3 100644
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -6,10 +6,15 @@
+  */
+ 
+ #include <dt-bindings/clock/histb-clock.h>
++#include <linux/bitfield.h>
++#include <linux/bits.h>
+ #include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/spinlock.h>
+ #include "clk.h"
+ #include "crg.h"
+ #include "reset.h"
+@@ -231,6 +236,225 @@ static const struct hisi_gate_clock hi3798cv200_gate_clks[] = {
+ 		CLK_SET_RATE_PARENT, 0xa8, 3, 0 },
+ };
+ 
++/*
++ * Mali-T720.  One clock object covers three registers of the core CRG:
++ *
++ *   0xd4  bit 0 = clock gate, bit 4 = soft reset (1 = asserted)
++ *   0x124 [2:0] = rate selector, bit 9 = bypass, bit 10 = switch request
++ *   0x154 [7:5] = selector the hardware is actually running (read-only)
++ *
++ * The sequences follow the vendor 4.4 SDK (drivers/hisilicon/clk/hi3798cv2x/
++ * clk-higpu.c): enabling pulses the soft reset with the gate open, then the
++ * selector is programmed and the status field is polled until it agrees.
++ * Reset is owned by this clock on purpose - the device tree does not list it
++ * under "resets", so nothing else can leave the GPU in reset behind the
++ * clock's back.
++ */
++#define HI3798CV200_GPU_GATE_RESET	0xd4
++#define HI3798CV200_GPU_CLK_CTRL	0x124
++#define HI3798CV200_GPU_CLK_STATUS	0x154
++#define HI3798CV200_GPU_CKEN		BIT(0)
++#define HI3798CV200_GPU_SRST		BIT(4)
++#define HI3798CV200_GPU_SEL_MASK	GENMASK(2, 0)
++#define HI3798CV200_GPU_BYPASS		BIT(9)
++#define HI3798CV200_GPU_SWITCH		BIT(10)
++#define HI3798CV200_GPU_STATUS_MASK	GENMASK(7, 5)
++
++static const struct {
++	unsigned long rate;
++	u8 sel;
++} hi3798cv200_gpu_rates[] = {
++	{ 200000000, 7 },	/* safe default, same as the vendor's index 0 */
++	{ 300000000, 4 },
++	{ 400000000, 1 },
++	{ 500000000, 6 },
++	{ 600000000, 3 },
++	{ 675000000, 5 },
++};
++
++struct hi3798cv200_gpu_clk {
++	struct clk_hw hw;
++	void __iomem *base;
++	spinlock_t lock;	/* 0xd4 / 0x124 read-modify-write */
++	u8 sel;			/* selector to program on the next enable */
++};
++
++#define to_gpu_clk(_hw) container_of(_hw, struct hi3798cv200_gpu_clk, hw)
++
++static int hi3798cv200_gpu_find(unsigned long rate)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798cv200_gpu_rates); i++)
++		if (hi3798cv200_gpu_rates[i].rate == rate)
++			return i;
++	return -EINVAL;
++}
++
++/* Caller holds gpu->lock.  Never sleeps: it runs under the enable lock. */
++static int hi3798cv200_gpu_switch(struct hi3798cv200_gpu_clk *gpu, u8 sel)
++{
++	u32 reg, status;
++
++	reg = readl(gpu->base + HI3798CV200_GPU_CLK_CTRL);
++	reg &= ~(HI3798CV200_GPU_SEL_MASK | HI3798CV200_GPU_SWITCH);
++	reg |= HI3798CV200_GPU_BYPASS | sel;
++	writel(reg, gpu->base + HI3798CV200_GPU_CLK_CTRL);
++	writel(reg | HI3798CV200_GPU_SWITCH,
++	       gpu->base + HI3798CV200_GPU_CLK_CTRL);
++
++	return readl_poll_timeout_atomic(gpu->base + HI3798CV200_GPU_CLK_STATUS,
++		status,
++		FIELD_GET(HI3798CV200_GPU_STATUS_MASK, status) == sel,
++		1, 1000);
++}
++
++static int hi3798cv200_gpu_clk_enable(struct clk_hw *hw)
++{
++	struct hi3798cv200_gpu_clk *gpu = to_gpu_clk(hw);
++	unsigned long flags;
++	u32 reg;
++	int ret;
++
++	spin_lock_irqsave(&gpu->lock, flags);
++
++	/* Open the gate with reset asserted, then release the reset. */
++	reg = readl(gpu->base + HI3798CV200_GPU_GATE_RESET);
++	reg |= HI3798CV200_GPU_CKEN | HI3798CV200_GPU_SRST;
++	writel(reg, gpu->base + HI3798CV200_GPU_GATE_RESET);
++	udelay(2);
++	reg &= ~HI3798CV200_GPU_SRST;
++	writel(reg, gpu->base + HI3798CV200_GPU_GATE_RESET);
++
++	ret = hi3798cv200_gpu_switch(gpu, gpu->sel);
++	if (ret) {
++		/* Fail closed: an unverified rate is not left running. */
++		reg &= ~HI3798CV200_GPU_CKEN;
++		writel(reg, gpu->base + HI3798CV200_GPU_GATE_RESET);
++		pr_err("hi3798cv200: GPU clock selector %u did not lock\n",
++		       gpu->sel);
++	}
++
++	spin_unlock_irqrestore(&gpu->lock, flags);
++	return ret;
++}
++
++static void hi3798cv200_gpu_clk_disable(struct clk_hw *hw)
++{
++	struct hi3798cv200_gpu_clk *gpu = to_gpu_clk(hw);
++	unsigned long flags;
++	u32 reg;
++
++	spin_lock_irqsave(&gpu->lock, flags);
++	reg = readl(gpu->base + HI3798CV200_GPU_GATE_RESET);
++	reg &= ~(HI3798CV200_GPU_CKEN | HI3798CV200_GPU_SRST);
++	writel(reg, gpu->base + HI3798CV200_GPU_GATE_RESET);
++	spin_unlock_irqrestore(&gpu->lock, flags);
++}
++
++static int hi3798cv200_gpu_clk_is_enabled(struct clk_hw *hw)
++{
++	struct hi3798cv200_gpu_clk *gpu = to_gpu_clk(hw);
++
++	return !!(readl(gpu->base + HI3798CV200_GPU_GATE_RESET) &
++		  HI3798CV200_GPU_CKEN);
++}
++
++static unsigned long hi3798cv200_gpu_clk_recalc_rate(struct clk_hw *hw,
++						     unsigned long parent_rate)
++{
++	struct hi3798cv200_gpu_clk *gpu = to_gpu_clk(hw);
++	u8 sel = FIELD_GET(HI3798CV200_GPU_STATUS_MASK,
++			   readl(gpu->base + HI3798CV200_GPU_CLK_STATUS));
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798cv200_gpu_rates); i++)
++		if (hi3798cv200_gpu_rates[i].sel == sel)
++			return hi3798cv200_gpu_rates[i].rate;
++	return 0;	/* not one of ours: report unknown, never guess */
++}
++
++static int hi3798cv200_gpu_clk_determine_rate(struct clk_hw *hw,
++					      struct clk_rate_request *req)
++{
++	unsigned long best = hi3798cv200_gpu_rates[0].rate;
++	unsigned long delta, best_delta = ULONG_MAX;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(hi3798cv200_gpu_rates); i++) {
++		unsigned long r = hi3798cv200_gpu_rates[i].rate;
++
++		delta = r > req->rate ? r - req->rate : req->rate - r;
++		if (delta < best_delta) {
++			best_delta = delta;
++			best = r;
++		}
++	}
++	req->rate = best;
++	return 0;
++}
++
++/*
++ * CLK_SET_RATE_UNGATE makes the core enable the clock around this call, so the
++ * selector switch always happens with the clock running; when the clock is
++ * already on, the switch is done in place.
++ */
++static int hi3798cv200_gpu_clk_set_rate(struct clk_hw *hw, unsigned long rate,
++					unsigned long parent_rate)
++{
++	struct hi3798cv200_gpu_clk *gpu = to_gpu_clk(hw);
++	unsigned long flags;
++	int idx, ret;
++
++	idx = hi3798cv200_gpu_find(rate);
++	if (idx < 0)
++		return idx;
++
++	spin_lock_irqsave(&gpu->lock, flags);
++	gpu->sel = hi3798cv200_gpu_rates[idx].sel;
++	ret = hi3798cv200_gpu_switch(gpu, gpu->sel);
++	spin_unlock_irqrestore(&gpu->lock, flags);
++
++	return ret;
++}
++
++static const struct clk_ops hi3798cv200_gpu_clk_ops = {
++	.enable = hi3798cv200_gpu_clk_enable,
++	.disable = hi3798cv200_gpu_clk_disable,
++	.is_enabled = hi3798cv200_gpu_clk_is_enabled,
++	.recalc_rate = hi3798cv200_gpu_clk_recalc_rate,
++	.determine_rate = hi3798cv200_gpu_clk_determine_rate,
++	.set_rate = hi3798cv200_gpu_clk_set_rate,
++};
++
++static int hi3798cv200_gpu_clk_register(struct platform_device *pdev,
++					struct hisi_clock_data *clk_data)
++{
++	struct hi3798cv200_gpu_clk *gpu;
++	struct clk_init_data init = {
++		.name = "clk_gpu",
++		.ops = &hi3798cv200_gpu_clk_ops,
++		.flags = CLK_SET_RATE_UNGATE | CLK_GET_RATE_NOCACHE,
++	};
++	int ret;
++
++	gpu = devm_kzalloc(&pdev->dev, sizeof(*gpu), GFP_KERNEL);
++	if (!gpu)
++		return -ENOMEM;
++
++	gpu->base = clk_data->base;
++	gpu->sel = hi3798cv200_gpu_rates[0].sel;
++	gpu->hw.init = &init;
++	spin_lock_init(&gpu->lock);
++
++	ret = devm_clk_hw_register(&pdev->dev, &gpu->hw);
++	if (ret)
++		return ret;
++
++	clk_data->clk_data.clks[HISTB_GPU_CLK] = gpu->hw.clk;
++	return 0;
++}
++
+ static struct hisi_clock_data *hi3798cv200_clk_register(
+ 				struct platform_device *pdev)
+ {
+@@ -267,6 +491,10 @@ static struct hisi_clock_data *hi3798cv200_clk_register(
+ 	if (ret)
+ 		goto unregister_mux;
+ 
++	ret = hi3798cv200_gpu_clk_register(pdev, clk_data);
++	if (ret)
++		goto unregister_gate;
++
+ 	ret = of_clk_add_provider(pdev->dev.of_node,
+ 			of_clk_src_onecell_get, &clk_data->clk_data);
+ 	if (ret)
+diff --git a/include/dt-bindings/clock/histb-clock.h b/include/dt-bindings/clock/histb-clock.h
+index 2d1f5d18d..13900f5b0 100644
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -83,6 +83,13 @@
+ #define HISTB_BPD_CLK			59
+ #define HISTB_VPSS_CLK			60
+ 
++/*
++ * Mali-T720 GPU: gate in CRG 0xd4 bit 0, rate selector in CRG 0x124 / 0x154.
++ * The community 6.12 tree numbers it 54, which is our SATA TX0 gate; it takes
++ * the next free public id here.
++ */
++#define HISTB_GPU_CLK			61
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2

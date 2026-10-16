@@ -1,0 +1,252 @@
+From: olragon <olragon@users.noreply.github.com>
+Subject: [PATCH] regulator: add the Hi3798CV200 CPU core-voltage PWM regulator
+
+CPU DVFS stage 2.  PMC+0x18 (period 201, duty -> 1150 mV - 2.5 mV * (duty - 1)), formula read
+from the stock kernel's cpu_volt_scale.  Hard clamp 800..1150 mV in the driver; period must read
+back 201 or the driver does not bind; every write is read back; 10 ms settle (the vendor's
+msleep(10) before touching the clock).  Kernel command line q10_cpu_vscale=0 (or the DT property
+hisilicon,no-voltage-scaling) forces 1150 mV and turns set_voltage into a no-op.  The CORE rail
+(PMC+0x20, shared with video/display) is not touched.  Not tested on hardware.
+---
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -449,6 +449,16 @@
+ 	  It is capable of supporting current and voltage regulators
+ 	  and the platform has to provide a mapping of GPIO-states
+ 	  to target volts/amps.
++
++config REGULATOR_HI3798CV200_CPU
++	tristate "HiSilicon Hi3798CV200 CPU core-voltage PWM regulator"
++	depends on ARCH_HISI || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	help
++	  Regulator for the CPU core rail of the Hi3798CV200, a PWM held in
++	  one register of the PMC block (650..1150 mV, 2.5 mV steps).  The
++	  voltage is clamped to 800..1150 mV in the driver itself, and can be
++	  switched off with q10_cpu_vscale=0 on the kernel command line.
+ 
+ config REGULATOR_HI6421
+ 	tristate "HiSilicon Hi6421 PMIC voltage regulator support"
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -53,6 +53,7 @@
+ obj-$(CONFIG_REGULATOR_FAN53555) += fan53555.o
+ obj-$(CONFIG_REGULATOR_FAN53880) += fan53880.o
+ obj-$(CONFIG_REGULATOR_GPIO) += gpio-regulator.o
++obj-$(CONFIG_REGULATOR_HI3798CV200_CPU) += hi3798cv200-cpu-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421) += hi6421-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421V530) += hi6421v530-regulator.o
+ obj-$(CONFIG_REGULATOR_HI6421V600) += hi6421v600-regulator.o
+--- /dev/null
++++ b/drivers/regulator/hi3798cv200-cpu-regulator.c
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HiSilicon Hi3798CV200 CPU core-voltage regulator (PMC PWM at PMC+0x18).
++ *
++ * One 32-bit register: [31:16] duty, [15:0] period.  The vendor kernel writes period 201 and
++ *
++ *	duty = 1 + (1150 - mV) * 2 / 5          V = 1150 mV - 2.5 mV * (duty - 1)
++ *
++ * i.e. 650..1150 mV in 2.5 mV steps (cpu_volt_scale, stock VA c07f4364).  The boot value on the
++ * Q10 Pro is 0x000100C9 = 1150 mV.  The CORE rail (PMC+0x20, shared with video/display) is a
++ * different register and is deliberately NOT handled here.
++ *
++ * Safety, in layers:
++ *  - the voltage can never leave [800, 1150] mV, whatever the device tree says (HARD_*);
++ *  - the PWM period must read back as 201 or the driver refuses to bind;
++ *  - every write is read back; a mismatch restores the old value and fails;
++ *  - voltage scaling can be switched off at boot (see below): the rail is then forced to 1150 mV
++ *    and set_voltage becomes a no-op that still reports success, so cpufreq keeps scaling the
++ *    FREQUENCY at full voltage.
++ *
++ * Disable: kernel command line "q10_cpu_vscale=0", or the DT property
++ * "hisilicon,no-voltage-scaling" on the regulator node.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/kstrtox.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/machine.h>
++#include <linux/regulator/of_regulator.h>
++
++#define PWM_MIN_UV		650000
++#define PWM_STEP_UV		2500
++#define PWM_N_VOLTAGES		201		/* 650000 .. 1150000 */
++#define PWM_PERIOD		201
++#define PWM_PERIOD_MASK		GENMASK(15, 0)
++#define PWM_DUTY_MASK		GENMASK(31, 16)
++
++/* Hard limits, independent of the device tree.  The vendor table never goes below 840 mV. */
++#define HARD_MIN_UV		800000
++#define HARD_MAX_UV		1150000
++#define BOOT_UV			1150000
++
++/* The vendor sleeps 10 ms after a voltage write before touching the clock (hi_device_scale). */
++#define SETTLE_US		10000
++
++static bool q10_cpu_vscale = true;
++
++static int __init q10_cpu_vscale_setup(char *str)
++{
++	bool on;
++
++	if (kstrtobool(str, &on))
++		return 0;
++	q10_cpu_vscale = on;
++	return 1;
++}
++__setup("q10_cpu_vscale=", q10_cpu_vscale_setup);
++
++struct hi3798cv200_cpu_reg {
++	void __iomem *base;
++	bool scaling;
++};
++
++static unsigned int uv_to_sel(unsigned int uv)
++{
++	return (uv - PWM_MIN_UV) / PWM_STEP_UV;
++}
++
++static u32 sel_to_reg(unsigned int sel)
++{
++	return FIELD_PREP(PWM_DUTY_MASK, PWM_PERIOD - sel) | PWM_PERIOD;
++}
++
++static int hi3798cv200_cpu_get_voltage_sel(struct regulator_dev *rdev)
++{
++	struct hi3798cv200_cpu_reg *r = rdev_get_drvdata(rdev);
++	u32 v = readl(r->base);
++	u32 duty = FIELD_GET(PWM_DUTY_MASK, v);
++
++	if (FIELD_GET(PWM_PERIOD_MASK, v) != PWM_PERIOD)
++		return -EIO;
++	if (!duty || duty > PWM_PERIOD)
++		return -EINVAL;
++	return PWM_PERIOD - duty;
++}
++
++static int hi3798cv200_cpu_set_voltage_sel(struct regulator_dev *rdev, unsigned int sel)
++{
++	struct hi3798cv200_cpu_reg *r = rdev_get_drvdata(rdev);
++	u32 old, want, got;
++
++	if (sel >= PWM_N_VOLTAGES ||
++	    sel < uv_to_sel(HARD_MIN_UV) || sel > uv_to_sel(HARD_MAX_UV))
++		return -EINVAL;
++
++	/* Scaling off: the rail stays where probe put it (1150 mV); the request "succeeds". */
++	if (!r->scaling)
++		return 0;
++
++	old = readl(r->base);
++	want = sel_to_reg(sel);
++	writel(want, r->base);
++	usleep_range(SETTLE_US, SETTLE_US + 500);
++
++	got = readl(r->base);
++	if (got != want) {
++		dev_err(&rdev->dev, "voltage write not retained: wrote %#x read %#x, restoring %#x\n",
++			want, got, old);
++		writel(old, r->base);
++		readl(r->base);
++		return -EIO;
++	}
++	return 0;
++}
++
++static const struct regulator_ops hi3798cv200_cpu_ops = {
++	.list_voltage	 = regulator_list_voltage_linear,
++	.map_voltage	 = regulator_map_voltage_linear,
++	.get_voltage_sel = hi3798cv200_cpu_get_voltage_sel,
++	.set_voltage_sel = hi3798cv200_cpu_set_voltage_sel,
++};
++
++static const struct regulator_desc hi3798cv200_cpu_desc = {
++	.name		= "vdd-cpu",
++	.type		= REGULATOR_VOLTAGE,
++	.owner		= THIS_MODULE,
++	.ops		= &hi3798cv200_cpu_ops,
++	.min_uV		= PWM_MIN_UV,
++	.uV_step	= PWM_STEP_UV,
++	.n_voltages	= PWM_N_VOLTAGES,
++};
++
++static int hi3798cv200_cpu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct regulator_init_data *init;
++	struct regulator_config cfg = { };
++	struct hi3798cv200_cpu_reg *r;
++	struct regulator_dev *rdev;
++	u32 v;
++
++	r = devm_kzalloc(dev, sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++	r->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(r->base))
++		return PTR_ERR(r->base);
++
++	v = readl(r->base);
++	if (FIELD_GET(PWM_PERIOD_MASK, v) != PWM_PERIOD) {
++		dev_err(dev, "PWM period is %u, not %u: not the register layout we know, not binding\n",
++			(unsigned int)FIELD_GET(PWM_PERIOD_MASK, v), PWM_PERIOD);
++		return -ENODEV;
++	}
++
++	r->scaling = q10_cpu_vscale && !of_property_read_bool(dev->of_node,
++							      "hisilicon,no-voltage-scaling");
++	if (!r->scaling) {
++		/* Only ever moves the rail UP (to the boot value), never down. */
++		if (v != sel_to_reg(uv_to_sel(BOOT_UV))) {
++			writel(sel_to_reg(uv_to_sel(BOOT_UV)), r->base);
++			usleep_range(SETTLE_US, SETTLE_US + 500);
++		}
++		dev_info(dev, "voltage scaling DISABLED: rail held at %u mV\n", BOOT_UV / 1000);
++	}
++
++	init = of_get_regulator_init_data(dev, dev->of_node, &hi3798cv200_cpu_desc);
++	if (!init)
++		return -EINVAL;
++	/* Clamp whatever the device tree asked for. */
++	init->constraints.min_uV = clamp_t(int, init->constraints.min_uV, HARD_MIN_UV, HARD_MAX_UV);
++	init->constraints.max_uV = clamp_t(int, init->constraints.max_uV, HARD_MIN_UV, HARD_MAX_UV);
++
++	cfg.dev = dev;
++	cfg.driver_data = r;
++	cfg.of_node = dev->of_node;
++	cfg.init_data = init;
++	rdev = devm_regulator_register(dev, &hi3798cv200_cpu_desc, &cfg);
++	if (IS_ERR(rdev))
++		return PTR_ERR(rdev);
++
++	dev_info(dev, "PMC PWM regulator, %d mV now, limits %d..%d mV, scaling %s\n",
++		 PWM_MIN_UV / 1000 + hi3798cv200_cpu_get_voltage_sel(rdev) * PWM_STEP_UV / 1000,
++		 init->constraints.min_uV / 1000,
++		 init->constraints.max_uV / 1000, r->scaling ? "on" : "off");
++	return 0;
++}
++
++static const struct of_device_id hi3798cv200_cpu_of_match[] = {
++	{ .compatible = "hisilicon,hi3798cv200-cpu-regulator" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798cv200_cpu_of_match);
++
++static struct platform_driver hi3798cv200_cpu_driver = {
++	.probe = hi3798cv200_cpu_probe,
++	.driver = {
++		.name = "hi3798cv200-cpu-regulator",
++		.of_match_table = hi3798cv200_cpu_of_match,
++	},
++};
++module_platform_driver(hi3798cv200_cpu_driver);
++
++MODULE_DESCRIPTION("HiSilicon Hi3798CV200 CPU PWM regulator");
++MODULE_LICENSE("GPL");

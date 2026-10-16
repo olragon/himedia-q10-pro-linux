@@ -1,0 +1,7 @@
+#!/bin/sh
+# X session for the Q10 desktop test: openbox + a terminal + whatever $Q10_APP names.
+xsetroot -solid '#203040'
+xset s off -dpms
+xterm -geometry 100x30+40+40 -fa 'DejaVu Sans Mono' -fs 11 &
+[ -n "$Q10_APP" ] && sh -c "$Q10_APP" &
+exec openbox-session

@@ -1,0 +1,15 @@
+<settings version="2">
+    <!-- REQUIRED: CDisplaySettings::Load fails without a <resolutions> element, and a failed sub-settings load makes Kodi Reset()
+         ALL settings to defaults - silently discarding every value below. -->
+    <resolutions></resolutions>
+    <skinsettings></skinsettings>
+    <viewstates></viewstates>
+    <!-- DRM PRIME decoder: the only Kodi video path that can take a V4L2-request (drm_prime) frame. Default is false. -->
+    <setting id="videoplayer.useprimedecoder">true</setting>
+    <!-- use it for hardware hwaccel configs (this is what selects h264_v4l2request); default true, pinned for clarity -->
+    <setting id="videoplayer.useprimedecoderforhw">true</setting>
+    <!-- 0 = DIRECT: dma-buf straight onto the DRM video plane (V0, NV12), GUI stays on G0 (zero-copy, no GPU).
+         1 = GLES: import the dma-buf as an EGL image and draw it (needs EGL_EXT_image_dma_buf_import on panfrost, GPU load). -->
+    <setting id="videoplayer.useprimerenderer">0</setting>
+    <setting id="debug.showloginfo">true</setting>
+</settings>

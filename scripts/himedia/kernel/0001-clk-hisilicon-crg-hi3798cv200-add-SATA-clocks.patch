@@ -1,0 +1,58 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: crg-hi3798cv200 — add the SATA clocks
+
+The Hi3798CV200 CRG supplies four SATA clock gates in PERI_CRG42 at offset
+0xa8, but neither the binding header nor the driver named them, so a device
+tree describing the SoC's AHCI controller could not reference them. Nothing
+complained at build time: dtc accepts the reference, dt-validate accepts the
+node, and the only symptom was that the controller never probed.
+
+Bits are taken from the Hi3798CV200 register map (PERI_CRG42):
+
+  bit 0  sata_bus_cken          bit 8  sata_bus_srst_req
+  bit 1  sata_rx0_cken          bit 9  sata_cko_alive_srst_req
+  bit 2  sata_cko_alive_cken    bit 10 sata_rx0_srst_req
+  bit 3  sata_tx0_cken          bit 11 sata0_srst_req
+
+The resets are already reachable through the CRG's reset-cells, so only the
+four gates are added here. Ids 51-54 continue the public range, which ends at
+50, and stay clear of the driver-private ids that start at 64.
+
+SATA on this SoC is reached through combphy1 in PHY_TYPE_SATA mode; the
+combphy driver already implements that mux, so no PHY change is needed.
+
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -59,6 +59,15 @@
+ #define HISTB_USB3_PIPE_CLK1		49
+ #define HISTB_USB3_SUSPEND_CLK1		50
+ 
++/*
++ * SATA. All four gates live in PERI_CRG42 (CRG offset 0xa8) — bits 0..3 per the
++ * Hi3798CV200 register map; the matching resets are bits 8..11 of the same register.
++ */
++#define HISTB_SATA_BUS_CLK		51
++#define HISTB_SATA_RX0_CLK		52
++#define HISTB_SATA_CKO_ALIVE_CLK	53
++#define HISTB_SATA_TX0_CLK		54
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -191,6 +191,15 @@
+ 		CLK_SET_RATE_PARENT, 0xb0, 19, 0 },
+ 	{ HISTB_USB3_SUSPEND_CLK1, "clk_u3_suspend1", NULL,
+ 		CLK_SET_RATE_PARENT, 0xb0, 18, 0 },
++	/* SATA — PERI_CRG42 (0xa8), clock enables in bits 0..3 */
++	{ HISTB_SATA_BUS_CLK, "clk_sata_bus", NULL,
++		CLK_SET_RATE_PARENT, 0xa8, 0, 0 },
++	{ HISTB_SATA_RX0_CLK, "clk_sata_rx0", NULL,
++		CLK_SET_RATE_PARENT, 0xa8, 1, 0 },
++	{ HISTB_SATA_CKO_ALIVE_CLK, "clk_sata_cko_alive", NULL,
++		CLK_SET_RATE_PARENT, 0xa8, 2, 0 },
++	{ HISTB_SATA_TX0_CLK, "clk_sata_tx0", NULL,
++		CLK_SET_RATE_PARENT, 0xa8, 3, 0 },
+ };
+ 
+ static struct hisi_clock_data *hi3798cv200_clk_register(

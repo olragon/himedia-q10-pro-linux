@@ -1,0 +1,1728 @@
+LOCAL PATCH (not submitted anywhere): drm: hisilicon: histb-vdp - adopt the bootloader display, add an NV12 video plane
+
+A KMS driver for the Hi3798CV200 video display processor (VDP, 0xf8cc0000) whose
+goal is "decoder -> display controller" playback: the histb-vdec V4L2 decoder
+exports NV12 dma-bufs from CMA and the V0 video layer scans them out directly.
+
+  primary plane  "G0"  XRGB8888 / ARGB8888, any CMA buffer (global "alpha" property)
+  overlay plane  "V0"  NV12 / NV21, source crop, window position, BT.601/709 and
+                       limited/full range ("COLOR_ENCODING"/"COLOR_RANGE"); 1:1 by
+                       default, ZME scaling behind the allow_scale=1 module parameter
+  CRTC   "DHD0"  one fixed mode, READ BACK from the running DHD0 registers
+  connector      HDMI-A, always connected, one mode, no DDC
+
+It differs from the community 6.12 histb-vdp driver in what it refuses to do: it
+never writes DHD0 timing, never touches the CRG or the HDMI block, never soft-resets
+the VDP (the bootloader's 1080p60 HDMI link has to keep running - nothing here can
+retrain it) and never rewrites the G0 -> GP0 -> CBM route.  Its write set is G0, V0,
+VP0, the video colour core (VDM / CVM1) and CBM_MIX1; see histb_vdp_hw.c.  The only
+mixer change is CBM_MIX1 = VP0 | GP0 << 4 (what the vendor writes) so V0 reaches the
+output; the bootloader's value is restored when V0 goes away or the module is removed.
+
+simpledrm hand-over: an aperture_remove_conflicting_devices() over the boot
+framebuffer's address range evicts it at probe.  The reserved-memory region is not
+touched.  On module removal G0 is pointed back at that region; simpledrm does NOT
+re-probe by itself.
+
+Provenance: graphics layer and IRQ from the community histb-vdp.c; the video layer
+from the vendor 4.4.35 SDK (drivers/msp/drv/vo/vdp_v4_0, hi_reg_vdp.h); the ZME
+coefficient tables from the community histb-vpss driver (patch 0008).  Every claim
+is tagged [read]/[inferred]/[measured] in the sources.  Several V0 values come out of
+the vendor's closed PQ library and are [inferred]: the YUV->RGB scale (module
+parameters csc_shift / csc_scale2p retune it), the V0 stride unit (bytes assumed) and
+the ZME 6-tap vertical luma packing.  A debugfs "histb_vdp_regs" file dumps the
+registers; allow_poke=1 adds a write file.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain).
+Needs 0001..0010, and 0012 for the clocks named in the device tree.
+
+--- a/drivers/gpu/drm/hisilicon/Kconfig
++++ b/drivers/gpu/drm/hisilicon/Kconfig
+@@ -4,4 +4,5 @@
+ # Please keep this list sorted alphabetically
+ 
+ source "drivers/gpu/drm/hisilicon/hibmc/Kconfig"
++source "drivers/gpu/drm/hisilicon/histb/Kconfig"
+ source "drivers/gpu/drm/hisilicon/kirin/Kconfig"
+--- a/drivers/gpu/drm/hisilicon/Makefile
++++ b/drivers/gpu/drm/hisilicon/Makefile
+@@ -4,4 +4,5 @@
+ # Please keep this list sorted alphabetically
+ 
+ obj-$(CONFIG_DRM_HISI_HIBMC) += hibmc/
++obj-$(CONFIG_DRM_HISI_HISTB_VDP) += histb/
+ obj-$(CONFIG_DRM_HISI_KIRIN) += kirin/
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/Kconfig
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config DRM_HISI_HISTB_VDP
++	tristate "DRM Support for HiSilicon Hi3798CV200 VDP (adopts the bootloader display)"
++	depends on DRM && OF && (ARCH_HISI || COMPILE_TEST)
++	select DRM_CLIENT_SELECTION
++	select DRM_GEM_DMA_HELPER
++	select DRM_KMS_HELPER
++	help
++	  KMS driver for the video display processor of the HiSilicon
++	  Hi3798CV200 set-top-box SoC.  It does not program the display
++	  timing: it adopts the 1080p mode the bootloader already started,
++	  exposes the G0 graphics layer as the primary plane and the V0
++	  video layer as an NV12/NV21 overlay plane that scans out
++	  physically contiguous (CMA) buffers directly.
++
++	  When loaded it takes over from simpledrm.  If M is selected the
++	  module will be called histb-vdp.
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++histb-vdp-y := histb_vdp_drv.o histb_vdp_hw.o histb_vdp_zme.o
++
++obj-$(CONFIG_DRM_HISI_HISTB_VDP) += histb-vdp.o
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp.h
+@@ -0,0 +1,260 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * HiSilicon Hi3798CV200 video display processor (VDP) - register map and
++ * driver structures.
++ *
++ * Provenance tags used in this driver:
++ *   [read]     taken from a named source line (community 6.12 histb-vdp.c, or
++ *              the vendor 4.4.35 SDK, "VT" = drivers/msp/drv/vo/vdp_v4_0 and
++ *              drivers/common/include/hi3798cv200/hi_reg_vdp.h)
++ *   [inferred] reasoned from those sources, not seen on hardware
++ *   [measured] seen on the running Q10 Pro (docs/261011-himedia-full-linux-goal.md)
++ *
++ * Nothing here has run on hardware yet.
++ */
++#ifndef HISTB_VDP_H
++#define HISTB_VDP_H
++
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/io.h>
++#include <linux/spinlock.h>
++
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_device.h>
++#include <drm/drm_encoder.h>
++#include <drm/drm_mode.h>
++#include <drm/drm_plane.h>
++
++/* ---- global block ------------------------------------------------------ */
++#define VDP_VOINTSTA		0x0004	/* [read] hi_reg_vdp.h */
++#define VDP_VOMSKINTSTA		0x0008	/* write 1 = clear (community: acks vblank) */
++#define VDP_VOINTMSK		0x000c
++#define  VDP_INT_DHD0_VTTHD1	BIT(0)	/* DHD0 vertical threshold 1 */
++
++/* ---- V0: video layer 0. Stride between video layers is 0x800 [read VT vdp_define.h:109] ---- */
++#define VDP_V0_CTRL		0x0800
++#define  V0_CTRL_IFMT		GENMASK(3, 0)	/* 3 = semi-planar 4:2:0 [read VT vdp_define.h:547] */
++#define  V0_IFMT_SP_420		0x3
++#define  V0_CTRL_REQ_CTRL	GENMASK(7, 5)	/* VDP_DRIVER_Initial: V0 = 3 [read VT vdp_software_selfdefine.c:308] */
++#define  V0_CTRL_NOSEC		BIT(10)
++#define  V0_CTRL_UV_ORDER	BIT(11)
++#define  V0_CTRL_CHM_RMODE	GENMASK(13, 12)	/* 1 = progressive */
++#define  V0_CTRL_LM_RMODE	GENMASK(15, 14)
++#define  V0_CTRL_IFIR_MODE	GENMASK(19, 18)	/* 3 = 6-tap FIR [read VT vdp_drv_vid.c:291] */
++#define  V0_CTRL_FLIP		BIT(26)
++#define  V0_CTRL_MUTE		BIT(27)
++#define  V0_CTRL_DATA_WIDTH	GENMASK(29, 28)	/* 0 = 8 bit, 1 = 10 bit */
++#define  V0_CTRL_SURFACE_EN	BIT(31)
++#define VDP_V0_UPD		0x0804		/* bit0 regup */
++#define VDP_V0_PRERD		0x0820		/* bit31 pre_rd_en */
++#define  V0_PRERD_EN		BIT(31)
++#define VDP_V0_IRESO		0x0828		/* [11:0] w-1, [23:12] h-1 */
++#define VDP_V0_ORESO		0x082c		/* ZME output size */
++#define VDP_V0_CBMPARA		0x0838		/* [7:0] galpha */
++#define VDP_V0_PARAUP		0x0840		/* coefficient-memory reload strobes */
++#define  V0_PARAUP_HL		BIT(0)
++#define  V0_PARAUP_HC		BIT(1)
++#define  V0_PARAUP_VL		BIT(2)
++#define  V0_PARAUP_VC		BIT(3)
++#define VDP_V0_CPOS		0x0844		/* [11:0] first x, [23:12] last x (horizontal crop) */
++#define VDP_V0_HLCOEFAD		0x0850
++#define VDP_V0_HCCOEFAD		0x0854
++#define VDP_V0_VLCOEFAD		0x0858
++#define VDP_V0_VCCOEFAD		0x085c
++#define VDP_V0_DFPOS		0x0860		/* display window, [11:0] x, [23:12] y */
++#define VDP_V0_DLPOS		0x0864		/* last pixel (inclusive) */
++#define VDP_V0_VFPOS		0x0868		/* video window */
++#define VDP_V0_VLPOS		0x086c
++#define VDP_V0_BK		0x0870
++#define VDP_V0_ALPHA		0x0874
++#define VDP_V0_MUTE_BK		0x0878
++#define VDP_V0_HSP		0x08c0
++#define  V0_HSP_HRATIO		GENMASK(23, 0)	/* in/out * 2^20 [read VT vdp_drv_vid.c:1465] */
++#define  V0_HSP_HFIR_ORDER	BIT(24)		/* CV200 forces 1 [read VT vdp_hal_vid.c:1964] */
++#define  V0_HSP_HCHFIR_EN	BIT(25)
++#define  V0_HSP_HLFIR_EN	BIT(26)
++#define  V0_HSP_HCHMSC_EN	BIT(30)
++#define  V0_HSP_HLMSC_EN	BIT(31)
++#define VDP_V0_HLOFFSET		0x08c4
++#define VDP_V0_HCOFFSET		0x08c8
++#define VDP_V0_VSP		0x08d8
++#define  V0_VSP_ZME_IN_FMT	GENMASK(20, 19)	/* 0 = 4:2:2, 1 = 4:2:0, 2 = 4:4:4 */
++#define  V0_VSP_ZME_OUT_FMT	GENMASK(22, 21)
++#define  V0_VSP_VCHFIR_EN	BIT(23)
++#define  V0_VSP_VLFIR_EN	BIT(24)
++#define  V0_VSP_VCHMSC_EN	BIT(30)
++#define  V0_VSP_VLMSC_EN	BIT(31)
++#define VDP_V0_VSR		0x08dc		/* [15:0] in/out * 2^12 */
++#define VDP_V0_VOFFSET		0x08e0		/* [15:0] chroma, [31:16] luma phase */
++#define VDP_V0_VBOFFSET		0x08e4
++#define VDP_V0_SMMU_BYPASS0	0x09a0		/* region 0 luma = bit0, chroma = bit1 ... */
++#define VDP_V0_P0LADDR		0x0a04
++#define VDP_V0_P0CADDR		0x0a08
++#define VDP_V0_P0STRIDE		0x0a0c		/* [15:0] luma, [31:16] chroma; unit [inferred] bytes */
++#define VDP_V0_16REGIONENL	0x0f00		/* VT vdp_hal_vid.c:178 writes 1 with the layer enable */
++
++/* ---- VP0: video-processing stage between V0 and the CBM mixer ---- */
++#define VDP_VP0_CTRL		0x6000
++#define  VP0_CTRL_MUTE		BIT(8)
++#define VDP_VP0_UPD		0x6004
++#define VDP_VP0_IRESO		0x6008
++#define VDP_VP0_GALPHA		0x6020
++#define VDP_VP0_DFPOS		0x6040
++#define VDP_VP0_DLPOS		0x6044
++#define VDP_VP0_VFPOS		0x6048
++#define VDP_VP0_VLPOS		0x604c
++
++/* ---- video HDR/colour core: V0 reaches VP0 through this (SDR still goes through it on CV200) ---- */
++#define VDP_VDM_CTRL		0x3400		/* bit0 v_vdm_en */
++#define VDP_VDM_YUV2RGB_CTRL	0x3500
++#define  VDM_Y2R_EN		BIT(0)
++#define  VDM_Y2R_V0_CSC_EN	BIT(1)
++#define  VDM_Y2R_V0_GAMMA_EN	BIT(8)
++#define VDP_VDM_YUV2RGB_COEF(n)	(0x3504 + 4 * (n))	/* n = 0..8 row-major, 16 bit signed */
++#define VDP_VDM_YUV2RGB_SCALE2P	0x354c
++#define VDP_VDM_YUV2RGB_IN_DC(n)  (0x3550 + 4 * (n))	/* n = 0..2, 14 bit signed */
++#define VDP_VDM_YUV2RGB_OUT_DC(n) (0x355c + 4 * (n))	/* n = 0..2, 32 bit */
++#define VDP_VDM_RGB2LMS_CTRL	0x3600
++#define VDP_VDM_RGB2LMS_COEF(n)	(0x3604 + 4 * (n))
++#define VDP_VDM_RGB2LMS_SCALE2P	0x3628
++#define VDP_CVM_CTRL		0x3900		/* bit1 cvm_sel: video wants 0 */
++#define  CVM_CTRL_SEL		BIT(1)
++#define VDP_CVM1_LMS2IPT_CTRL	0x3a00
++#define VDP_CVM1_LMS2IPT_COEF(n) (0x3a04 + 4 * (n))
++#define VDP_CVM1_LMS2IPT_SCALE2P 0x3a28
++#define VDP_CVM1_LMS2IPT_MIN	0x3a2c
++#define VDP_CVM1_LMS2IPT_MAX	0x3a30
++#define VDP_CVM1_LMS2IPT_OUT_DC(n) (0x3a34 + 4 * (n))
++#define VDP_HDR_UPD		0x3f84		/* bit0 regup */
++
++/* ---- G0: graphics layer 0 (the boot-logo layer) [read community histb-vdp.c:69-91] ---- */
++#define VDP_G0_CTRL		0x7000
++#define  G0_CTRL_IFMT		GENMASK(7, 0)
++#define  G0_IFMT_KRGB8888	0x60	/* XRGB8888 */
++#define  G0_IFMT_ARGB8888	0x68
++#define  G0_CTRL_BITEXT		GENMASK(9, 8)
++#define  G0_CTRL_REQ_CTRL	GENMASK(15, 14)
++#define  G0_CTRL_READ_PROG	BIT(26)
++#define  G0_CTRL_UPDATE_PROG	BIT(27)
++#define  G0_CTRL_NONSECURE	BIT(30)
++#define  G0_CTRL_ENABLE		BIT(31)
++#define VDP_G0_UPD		0x7004
++#define VDP_G0_ADDR		0x7010
++#define VDP_G0_NADDR		0x7018
++#define VDP_G0_STRIDE		0x701c	/* 16-byte units [measured: 0x1E0 = 7680 B] */
++#define  G0_STRIDE_UNIT		16
++#define VDP_G0_IRESO		0x7020
++#define VDP_G0_SFPOS		0x7024
++#define VDP_G0_SMMU_BYPASS0	0x7028
++#define VDP_G0_CBMPARA		0x7030
++#define  G0_CBM_GALPHA		GENMASK(7, 0)
++#define  G0_CBM_PALPHA_EN	BIT(12)
++#define VDP_G0_DCMP_ADDR	0x7050
++#define VDP_G0_DCMP_NADDR	0x7054
++#define VDP_G0_DCMP_OFFSET	0x7058
++#define VDP_G0_DFPOS		0x7080
++#define VDP_G0_DLPOS		0x7084
++#define VDP_G0_VFPOS		0x7088
++#define VDP_G0_VLPOS		0x708c
++#define VDP_G0_ALPHA		0x7094
++
++/* ---- GP0: graphics processor between G0 and the mixer (left as the bootloader set it) ---- */
++#define VDP_GP0_UPD		0x8004
++
++/* ---- mixers [read hi_reg_vdp.h offsets; prio fields VT vdp_hal_comm.c:784] ---- */
++#define VDP_MIXV0_MIX		0xb008	/* [3:0] prio0, [7:4] prio1: value = layer id + 1 */
++#define VDP_CBM_MIX1		0xb408	/* [3:0] prio0 (bottom), [7:4] prio1: VP0 = 1, GP0 = 2 */
++#define  CBM_LAYER_VP0		0x1
++#define  CBM_LAYER_GP0		0x2
++
++/* ---- DHD0: HD display channel (timing generator; never written except VTTHD) ---- */
++#define VDP_DHD0_CTRL		0xc000
++#define  DHD0_CTRL_IOP		BIT(4)	/* progressive */
++#define  DHD0_CTRL_INTF_EN	BIT(31)
++#define VDP_DHD0_VSYNC		0xc004
++#define VDP_DHD0_HSYNC1		0xc008
++#define VDP_DHD0_HSYNC2		0xc00c
++#define VDP_DHD0_PWR		0xc014
++#define VDP_DHD0_VTTHD		0xc01c
++
++#define VDP_POS(x, y)		(((x) & 0xfff) | (((y) & 0xfff) << 12))
++#define VDP_SIZE(w, h)		VDP_POS((w) - 1, (h) - 1)
++
++#define HISTB_VDP_MAX_W		4096
++#define HISTB_VDP_MAX_H		2160
++
++/* snapshot of what the bootloader left in G0, restored on unbind */
++struct histb_vdp_boot_g0 {
++	u32 ctrl, addr, naddr, stride, ireso, sfpos, dfpos, dlpos, vfpos, vlpos;
++	u32 cbmpara, alpha;
++	u32 cbm_mix1;
++	u32 vp0_ctrl;
++};
++
++struct histb_vdp {
++	struct drm_device drm;
++	void __iomem *base;
++	int irq;
++
++	struct clk_bulk_data *clks;
++	int num_clks;
++
++	struct drm_plane primary;	/* G0 */
++	struct drm_plane overlay;	/* V0 */
++	struct drm_crtc crtc;
++	struct drm_encoder encoder;
++	struct drm_connector connector;
++	struct drm_display_mode mode;	/* adopted from DHD0, never changed */
++
++	spinlock_t irq_lock;		/* VOINTMSK read-modify-write */
++	bool vblank_on;
++
++	/* ZME coefficient memory: H at +0x000 (HL, HC at +0x100), V at +0x200 (VL, VC at +0x300) */
++	void *zme_coef;
++	dma_addr_t zme_coef_dma;
++
++	bool v0_chain_ready;		/* VDM/CVM identity setup done */
++	u64 zme_key;			/* ratio class last loaded into zme_coef */
++	struct histb_vdp_boot_g0 boot;
++};
++
++#define to_histb_vdp(d)	container_of(d, struct histb_vdp, drm)
++
++static inline u32 vdp_rd(struct histb_vdp *vdp, u32 off)
++{
++	return readl_relaxed(vdp->base + off);
++}
++
++static inline void vdp_wr(struct histb_vdp *vdp, u32 off, u32 val)
++{
++	writel_relaxed(val, vdp->base + off);
++}
++
++static inline void vdp_rmw(struct histb_vdp *vdp, u32 off, u32 clr, u32 set)
++{
++	vdp_wr(vdp, off, (vdp_rd(vdp, off) & ~clr) | set);
++}
++
++/* histb_vdp_hw.c */
++int histb_vdp_hw_read_mode(struct histb_vdp *vdp, struct drm_display_mode *mode);
++bool histb_vdp_hw_boot_fb(struct histb_vdp *vdp, u32 *base, u32 *size);
++void histb_vdp_hw_snapshot_boot(struct histb_vdp *vdp);
++void histb_vdp_hw_restore_boot(struct histb_vdp *vdp);
++void histb_vdp_hw_vblank(struct histb_vdp *vdp, bool on);
++void histb_vdp_hw_g0_update(struct histb_vdp *vdp, struct drm_plane_state *state);
++void histb_vdp_hw_g0_disable(struct histb_vdp *vdp);
++void histb_vdp_hw_v0_update(struct histb_vdp *vdp, struct drm_plane_state *state);
++void histb_vdp_hw_v0_disable(struct histb_vdp *vdp);
++void histb_vdp_hw_dump(struct histb_vdp *vdp, struct seq_file *m);
++
++/* histb_vdp_zme.c */
++void histb_vdp_zme_load(void *coef, unsigned int in_w, unsigned int out_w,
++			unsigned int in_h, unsigned int out_h);
++
++extern bool histb_vdp_allow_scale;
++extern int histb_vdp_csc_scale2p;
++extern int histb_vdp_csc_shift;
++
++#endif /* HISTB_VDP_H */
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp_drv.c
+@@ -0,0 +1,645 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * DRM/KMS driver for the HiSilicon Hi3798CV200 video display processor.
++ *
++ * Unlike the community 6.12 histb-vdp driver, this one ADOPTS the pipe the
++ * bootloader started: one CRTC whose single mode is read back from DHD0, a
++ * primary plane on the G0 graphics layer and an overlay plane on the V0 video
++ * layer that scans out NV12/NV21 directly from CMA memory (zero copy from the
++ * histb-vdec decoder).  It never re-programs timing, clocks, the HDMI block or
++ * the VDP reset - see histb_vdp_hw.c for the exact write set.
++ *
++ * Nothing in this driver has run on hardware yet.
++ */
++
++#include <linux/aperture.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/uaccess.h>
++
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_blend.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_debugfs.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_encoder.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_atomic_helper.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_modeset_helper.h>
++#include <drm/drm_plane_helper.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_vblank.h>
++
++#include "histb_vdp.h"
++
++bool histb_vdp_allow_scale;
++module_param_named(allow_scale, histb_vdp_allow_scale, bool, 0444);
++MODULE_PARM_DESC(allow_scale,
++		 "let the video plane scale through the ZME (coefficient tables are unverified); default 1:1 only");
++
++int histb_vdp_csc_scale2p = 10;
++module_param_named(csc_scale2p, histb_vdp_csc_scale2p, int, 0444);
++MODULE_PARM_DESC(csc_scale2p, "VDM YUV2RGB SCALE2P register value (vendor: 10)");
++
++int histb_vdp_csc_shift = 10;
++module_param_named(csc_shift, histb_vdp_csc_shift, int, 0444);
++MODULE_PARM_DESC(csc_shift, "fractional bits of the YUV2RGB coefficients (default 10)");
++
++static bool fbdev = true;
++module_param(fbdev, bool, 0444);
++MODULE_PARM_DESC(fbdev, "register an fbdev/console client on the primary plane (default 1)");
++
++static bool allow_poke;
++module_param(allow_poke, bool, 0444);
++MODULE_PARM_DESC(allow_poke, "expose a debugfs register write file (debug only)");
++
++static const u32 primary_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++};
++
++static const u32 overlay_formats[] = {
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++};
++
++static const u64 linear_only[] = {
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_INVALID,
++};
++
++/* ---------------------------------------------------------------------- */
++/* planes                                                                 */
++/* ---------------------------------------------------------------------- */
++
++static int histb_vdp_primary_check(struct drm_plane *plane,
++				   struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	struct drm_framebuffer *fb = new->fb;
++	int ret;
++
++	if (!new->crtc || !fb)
++		return 0;
++
++	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++
++	ret = drm_atomic_helper_check_plane_state(new, crtc_state,
++						  DRM_PLANE_NO_SCALING,
++						  DRM_PLANE_NO_SCALING,
++						  true, true);
++	if (ret || !new->visible)
++		return ret;
++
++	if (!IS_ALIGNED(fb->pitches[0], G0_STRIDE_UNIT) ||
++	    !IS_ALIGNED(drm_fb_dma_get_gem_addr(fb, new, 0), G0_STRIDE_UNIT))
++		return -EINVAL;
++
++	return 0;
++}
++
++static void histb_vdp_primary_update(struct drm_plane *plane,
++				     struct drm_atomic_state *state)
++{
++	struct histb_vdp *vdp = to_histb_vdp(plane->dev);
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
++
++	if (!new->visible)
++		histb_vdp_hw_g0_disable(vdp);
++	else
++		histb_vdp_hw_g0_update(vdp, new);
++}
++
++static void histb_vdp_primary_disable(struct drm_plane *plane,
++				      struct drm_atomic_state *state)
++{
++	histb_vdp_hw_g0_disable(to_histb_vdp(plane->dev));
++}
++
++static const struct drm_plane_helper_funcs histb_vdp_primary_helpers = {
++	.prepare_fb = drm_gem_plane_helper_prepare_fb,
++	.atomic_check = histb_vdp_primary_check,
++	.atomic_update = histb_vdp_primary_update,
++	.atomic_disable = histb_vdp_primary_disable,
++};
++
++static int histb_vdp_overlay_check(struct drm_plane *plane,
++				   struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	struct drm_framebuffer *fb = new->fb;
++	int min = DRM_PLANE_NO_SCALING, max = DRM_PLANE_NO_SCALING;
++	u32 sx, sy, sw, sh;
++	int ret;
++
++	if (!new->crtc || !fb)
++		return 0;
++
++	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++
++	if (histb_vdp_allow_scale) {
++		min = (1 << 16) / 16;	/* down to 1/16 */
++		max = 16 << 16;		/* up to 16x */
++	}
++
++	ret = drm_atomic_helper_check_plane_state(new, crtc_state, min, max,
++						  true, true);
++	if (ret || !new->visible)
++		return ret;
++
++	sx = new->src.x1 >> 16;
++	sy = new->src.y1 >> 16;
++	sw = drm_rect_width(&new->src) >> 16;
++	sh = drm_rect_height(&new->src) >> 16;
++
++	/* 4:2:0 chroma is half height/width: keep every crop edge on a chroma sample */
++	if ((sx | sy | sw | sh) & 1 || sw < 32 || sh < 32)
++		return -EINVAL;
++	/* fractional source coordinates would need sub-pixel phases */
++	if ((new->src.x1 | new->src.y1 | new->src.x2 | new->src.y2) & 0xffff)
++		return -EINVAL;
++	if (!histb_vdp_allow_scale &&
++	    (drm_rect_width(&new->dst) != sw || drm_rect_height(&new->dst) != sh))
++		return -EINVAL;
++
++	/* unit and alignment of the V0 addresses/strides are [inferred] 16 bytes */
++	if (!IS_ALIGNED(fb->pitches[0], 16) || !IS_ALIGNED(fb->pitches[1], 16) ||
++	    !IS_ALIGNED(fb->offsets[0], 16) || !IS_ALIGNED(fb->offsets[1], 16) ||
++	    fb->pitches[0] > 0xffff || fb->pitches[1] > 0xffff)
++		return -EINVAL;
++	if (!IS_ALIGNED(drm_fb_dma_get_gem_addr(fb, new, 0) - sx, 16) ||
++	    !IS_ALIGNED(drm_fb_dma_get_gem_addr(fb, new, 1) - sx, 16))
++		return -EINVAL;
++
++	return 0;
++}
++
++static void histb_vdp_overlay_update(struct drm_plane *plane,
++				     struct drm_atomic_state *state)
++{
++	struct histb_vdp *vdp = to_histb_vdp(plane->dev);
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
++
++	if (!new->visible)
++		histb_vdp_hw_v0_disable(vdp);
++	else
++		histb_vdp_hw_v0_update(vdp, new);
++}
++
++static void histb_vdp_overlay_disable(struct drm_plane *plane,
++				      struct drm_atomic_state *state)
++{
++	histb_vdp_hw_v0_disable(to_histb_vdp(plane->dev));
++}
++
++static const struct drm_plane_helper_funcs histb_vdp_overlay_helpers = {
++	.prepare_fb = drm_gem_plane_helper_prepare_fb,
++	.atomic_check = histb_vdp_overlay_check,
++	.atomic_update = histb_vdp_overlay_update,
++	.atomic_disable = histb_vdp_overlay_disable,
++};
++
++static const struct drm_plane_funcs histb_vdp_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.destroy = drm_plane_cleanup,
++	.reset = drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
++};
++
++/* ---------------------------------------------------------------------- */
++/* CRTC                                                                   */
++/* ---------------------------------------------------------------------- */
++
++static int histb_vdp_crtc_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
++{
++	struct histb_vdp *vdp = to_histb_vdp(crtc->dev);
++	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
++
++	if (!new->enable)
++		return 0;
++
++	/* the timing generator is the bootloader's; only its own mode is valid */
++	if (!drm_mode_match(&new->mode, &vdp->mode,
++			    DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_FLAGS))
++		return -EINVAL;
++
++	return 0;
++}
++
++static void histb_vdp_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state)
++{
++	drm_crtc_vblank_on(crtc);
++}
++
++static void histb_vdp_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_state *state)
++{
++	/* the display channel keeps running: only the planes are switched off */
++	drm_crtc_vblank_off(crtc);
++
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (crtc->state->event) {
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++	}
++	spin_unlock_irq(&crtc->dev->event_lock);
++}
++
++static void histb_vdp_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
++{
++	struct drm_pending_vblank_event *event = crtc->state->event;
++
++	if (!event)
++		return;
++
++	crtc->state->event = NULL;
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (crtc->state->active && drm_crtc_vblank_get(crtc) == 0)
++		drm_crtc_arm_vblank_event(crtc, event);
++	else
++		drm_crtc_send_vblank_event(crtc, event);
++	spin_unlock_irq(&crtc->dev->event_lock);
++}
++
++static const struct drm_crtc_helper_funcs histb_vdp_crtc_helpers = {
++	.atomic_check = histb_vdp_crtc_check,
++	.atomic_enable = histb_vdp_crtc_enable,
++	.atomic_disable = histb_vdp_crtc_disable,
++	.atomic_flush = histb_vdp_crtc_flush,
++};
++
++static int histb_vdp_enable_vblank(struct drm_crtc *crtc)
++{
++	histb_vdp_hw_vblank(to_histb_vdp(crtc->dev), true);
++	return 0;
++}
++
++static void histb_vdp_disable_vblank(struct drm_crtc *crtc)
++{
++	histb_vdp_hw_vblank(to_histb_vdp(crtc->dev), false);
++}
++
++static const struct drm_crtc_funcs histb_vdp_crtc_funcs = {
++	.reset = drm_atomic_helper_crtc_reset,
++	.destroy = drm_crtc_cleanup,
++	.set_config = drm_atomic_helper_set_config,
++	.page_flip = drm_atomic_helper_page_flip,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank = histb_vdp_enable_vblank,
++	.disable_vblank = histb_vdp_disable_vblank,
++};
++
++static irqreturn_t histb_vdp_irq(int irq, void *data)
++{
++	struct histb_vdp *vdp = data;
++
++	if (!(vdp_rd(vdp, VDP_VOINTSTA) & VDP_INT_DHD0_VTTHD1))
++		return IRQ_NONE;
++
++	vdp_wr(vdp, VDP_VOMSKINTSTA, VDP_INT_DHD0_VTTHD1);
++	drm_crtc_handle_vblank(&vdp->crtc);
++
++	return IRQ_HANDLED;
++}
++
++/* ---------------------------------------------------------------------- */
++/* connector: one fixed, always-connected mode, no DDC                    */
++/* ---------------------------------------------------------------------- */
++
++static int histb_vdp_conn_get_modes(struct drm_connector *conn)
++{
++	struct histb_vdp *vdp = to_histb_vdp(conn->dev);
++	struct drm_display_mode *mode = drm_mode_duplicate(conn->dev, &vdp->mode);
++
++	if (!mode)
++		return 0;
++
++	drm_mode_probed_add(conn, mode);
++	return 1;
++}
++
++static enum drm_mode_status histb_vdp_conn_mode_valid(struct drm_connector *conn,
++						      const struct drm_display_mode *mode)
++{
++	struct histb_vdp *vdp = to_histb_vdp(conn->dev);
++
++	return drm_mode_match(mode, &vdp->mode,
++			      DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_FLAGS) ?
++	       MODE_OK : MODE_BAD;
++}
++
++static enum drm_connector_status histb_vdp_conn_detect(struct drm_connector *conn,
++						       bool force)
++{
++	return connector_status_connected;
++}
++
++static const struct drm_connector_helper_funcs histb_vdp_conn_helpers = {
++	.get_modes = histb_vdp_conn_get_modes,
++	.mode_valid = histb_vdp_conn_mode_valid,
++};
++
++static const struct drm_connector_funcs histb_vdp_conn_funcs = {
++	.detect = histb_vdp_conn_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = drm_connector_cleanup,
++	.reset = drm_atomic_helper_connector_reset,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++/* ---------------------------------------------------------------------- */
++/* debugfs                                                                */
++/* ---------------------------------------------------------------------- */
++
++#ifdef CONFIG_DEBUG_FS
++static int histb_vdp_regs_show(struct seq_file *m, void *data)
++{
++	histb_vdp_hw_dump(((struct drm_debugfs_entry *)m->private)->file.data, m); /* not vdp: drm_debugfs_add_file */
++	return 0;
++}
++
++static ssize_t histb_vdp_poke_write(struct file *file, const char __user *ubuf,
++				    size_t len, loff_t *ppos)
++{
++	struct histb_vdp *vdp = file->private_data;
++	unsigned int off, val;
++	char buf[48];
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	buf[len] = 0;
++	if (sscanf(buf, "%i %i", &off, &val) != 2 || off >= 0x10000 || off & 3)
++		return -EINVAL;
++
++	vdp_wr(vdp, off, val);
++	return len;
++}
++
++static const struct file_operations histb_vdp_poke_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = histb_vdp_poke_write,
++};
++
++static void histb_vdp_debugfs_init(struct drm_minor *minor)
++{
++	struct histb_vdp *vdp = to_histb_vdp(minor->dev);
++
++	drm_debugfs_add_file(minor->dev, "histb_vdp_regs", histb_vdp_regs_show, vdp);
++	if (allow_poke)
++		debugfs_create_file("histb_vdp_poke", 0200, minor->debugfs_root,
++				    vdp, &histb_vdp_poke_fops);
++}
++#endif
++
++/* ---------------------------------------------------------------------- */
++/* driver                                                                 */
++/* ---------------------------------------------------------------------- */
++
++static const struct drm_mode_config_funcs histb_vdp_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++DEFINE_DRM_GEM_DMA_FOPS(histb_vdp_fops);
++
++/* G0 and V0 take their line pitch in 16-byte units, so dumb buffers are 16-byte aligned */
++static int histb_vdp_dumb_create(struct drm_file *file, struct drm_device *drm,
++				 struct drm_mode_create_dumb *args)
++{
++	args->pitch = ALIGN(DIV_ROUND_UP(args->width * args->bpp, 8), G0_STRIDE_UNIT);
++	args->size = 0;
++
++	return drm_gem_dma_dumb_create_internal(file, drm, args);
++}
++
++static const struct drm_driver histb_vdp_driver = {
++	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops = &histb_vdp_fops,
++	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(histb_vdp_dumb_create),
++	DRM_FBDEV_DMA_DRIVER_OPS,
++#ifdef CONFIG_DEBUG_FS
++	.debugfs_init = histb_vdp_debugfs_init,
++#endif
++	.name = "histb-vdp",
++	.desc = "HiSilicon Hi3798CV200 display processor (adopting)",
++	.major = 1,
++	.minor = 0,
++};
++
++static int histb_vdp_create_planes(struct histb_vdp *vdp)
++{
++	struct drm_device *drm = &vdp->drm;
++	int ret;
++
++	ret = drm_universal_plane_init(drm, &vdp->primary, BIT(0),
++				       &histb_vdp_plane_funcs, primary_formats,
++				       ARRAY_SIZE(primary_formats), linear_only,
++				       DRM_PLANE_TYPE_PRIMARY, "G0");
++	if (ret)
++		return ret;
++	drm_plane_helper_add(&vdp->primary, &histb_vdp_primary_helpers);
++	/*
++	 * G0 sits above V0 in the mixer.  An opaque XRGB primary therefore
++	 * hides the video; set the primary's "alpha" to 0 (or use an ARGB
++	 * buffer with transparent pixels) to see the overlay through it.
++	 */
++	ret = drm_plane_create_alpha_property(&vdp->primary);
++	if (ret)
++		return ret;
++	ret = drm_plane_create_zpos_immutable_property(&vdp->primary, 1);
++	if (ret)
++		return ret;
++
++	ret = drm_universal_plane_init(drm, &vdp->overlay, BIT(0),
++				       &histb_vdp_plane_funcs, overlay_formats,
++				       ARRAY_SIZE(overlay_formats), linear_only,
++				       DRM_PLANE_TYPE_OVERLAY, "V0");
++	if (ret)
++		return ret;
++	drm_plane_helper_add(&vdp->overlay, &histb_vdp_overlay_helpers);
++	ret = drm_plane_create_zpos_immutable_property(&vdp->overlay, 0);
++	if (ret)
++		return ret;
++
++	return drm_plane_create_color_properties(&vdp->overlay,
++			BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
++			BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) |
++			BIT(DRM_COLOR_YCBCR_FULL_RANGE),
++			DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
++}
++
++static int histb_vdp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct histb_vdp *vdp;
++	struct drm_device *drm;
++	u32 fb_base, fb_size;
++	int ret;
++
++	vdp = devm_drm_dev_alloc(dev, &histb_vdp_driver, struct histb_vdp, drm);
++	if (IS_ERR(vdp))
++		return PTR_ERR(vdp);
++	drm = &vdp->drm;
++	spin_lock_init(&vdp->irq_lock);
++
++	vdp->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(vdp->base))
++		return PTR_ERR(vdp->base);
++	vdp->irq = platform_get_irq(pdev, 0);
++	if (vdp->irq < 0)
++		return vdp->irq;
++
++	/*
++	 * Clocks are optional: the bootloader already runs the whole pipe.
++	 * The V0 gate is the one it may have left off; the rest are held so
++	 * they cannot be gated while this driver owns the display.
++	 */
++	ret = devm_clk_bulk_get_all_enabled(dev, &vdp->clks);
++	if (ret < 0 && ret != -ENOENT)
++		return dev_err_probe(dev, ret, "enabling VDP clocks\n");
++	vdp->num_clks = max(ret, 0);
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "DMA mask\n");
++
++	ret = histb_vdp_hw_read_mode(vdp, &vdp->mode);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "bootloader display not running or not progressive\n");
++	dev_info(dev, "adopting bootloader mode " DRM_MODE_FMT "\n",
++		 DRM_MODE_ARG(&vdp->mode));
++
++	histb_vdp_hw_snapshot_boot(vdp);
++
++	vdp->zme_coef = dmam_alloc_coherent(dev, SZ_4K, &vdp->zme_coef_dma, GFP_KERNEL);
++	if (!vdp->zme_coef)
++		return -ENOMEM;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++	drm->mode_config.min_width = 32;
++	drm->mode_config.min_height = 32;
++	drm->mode_config.max_width = HISTB_VDP_MAX_W;
++	drm->mode_config.max_height = HISTB_VDP_MAX_H;
++	drm->mode_config.preferred_depth = 24;
++	drm->mode_config.funcs = &histb_vdp_mode_config_funcs;
++
++	ret = histb_vdp_create_planes(vdp);
++	if (ret)
++		return ret;
++
++	ret = drm_crtc_init_with_planes(drm, &vdp->crtc, &vdp->primary, NULL,
++					&histb_vdp_crtc_funcs, "DHD0");
++	if (ret)
++		return ret;
++	drm_crtc_helper_add(&vdp->crtc, &histb_vdp_crtc_helpers);
++
++	vdp->encoder.possible_crtcs = BIT(0);
++	ret = drm_simple_encoder_init(drm, &vdp->encoder, DRM_MODE_ENCODER_TMDS);
++	if (ret)
++		return ret;
++
++	ret = drm_connector_init(drm, &vdp->connector, &histb_vdp_conn_funcs,
++				 DRM_MODE_CONNECTOR_HDMIA);
++	if (ret)
++		return ret;
++	drm_connector_helper_add(&vdp->connector, &histb_vdp_conn_helpers);
++	ret = drm_connector_attach_encoder(&vdp->connector, &vdp->encoder);
++	if (ret)
++		return ret;
++
++	ret = drm_vblank_init(drm, 1);
++	if (ret)
++		return ret;
++	/* the interrupt stays masked in VOINTMSK until a vblank is requested */
++	vdp_wr(vdp, VDP_VOINTMSK, 0);
++	ret = devm_request_irq(dev, vdp->irq, histb_vdp_irq, 0, dev_name(dev), vdp);
++	if (ret)
++		return dev_err_probe(dev, ret, "VDP IRQ\n");
++
++	drm_mode_config_reset(drm);
++	platform_set_drvdata(pdev, vdp);
++
++	/*
++	 * Take over from simpledrm.  Only the boot framebuffer's address range
++	 * is named, so no other platform framebuffer is touched.  The
++	 * reserved-memory region itself is left alone.
++	 */
++	if (histb_vdp_hw_boot_fb(vdp, &fb_base, &fb_size)) {
++		ret = aperture_remove_conflicting_devices(fb_base, fb_size,
++							  histb_vdp_driver.name);
++		if (ret)
++			return ret;
++	}
++
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		return ret;
++
++	if (fbdev)
++		drm_client_setup_with_fourcc(drm, DRM_FORMAT_XRGB8888);
++
++	return 0;
++}
++
++static void histb_vdp_remove(struct platform_device *pdev)
++{
++	struct histb_vdp *vdp = platform_get_drvdata(pdev);
++
++	drm_dev_unplug(&vdp->drm);
++	drm_atomic_helper_shutdown(&vdp->drm);
++	/*
++	 * Leave the display alive and showing the bootloader's buffer rather
++	 * than scanning freed memory.  simpledrm does NOT come back by itself.
++	 */
++	histb_vdp_hw_restore_boot(vdp);
++}
++
++static const struct of_device_id histb_vdp_of_match[] = {
++	{ .compatible = "hisilicon,hi3798cv200-vdp" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, histb_vdp_of_match);
++
++static struct platform_driver histb_vdp_platform_driver = {
++	.probe = histb_vdp_probe,
++	.remove = histb_vdp_remove,
++	.driver = {
++		.name = "histb-vdp",
++		.of_match_table = histb_vdp_of_match,
++	},
++};
++module_platform_driver(histb_vdp_platform_driver);
++
++MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDP DRM driver (adopts the bootloader display, NV12 video plane)");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp_hw.c
+@@ -0,0 +1,509 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Hi3798CV200 VDP - register programming for the G0 graphics layer and the
++ * V0 video layer.
++ *
++ * Policy: the bootloader's display pipe is ADOPTED, not re-programmed.  This
++ * file never writes DHD0 timing, the CRG, the HDMI block, the VDP soft reset
++ * or the G0 -> GP0 -> CBM route.  It writes the G0 layer registers, the V0
++ * layer registers, VP0, the video colour core (VDM/CVM1) and one mixer word
++ * (CBM_MIX1) so the video layer reaches the output.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/math64.h>
++#include <linux/seq_file.h>
++
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_print.h>
++#include <drm/drm_rect.h>
++
++#include "histb_vdp.h"
++
++/* ---------------------------------------------------------------------- */
++/* adopted mode                                                           */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * Read the running DHD0 timing back into a drm_display_mode.  The field
++ * encoding is the inverse of the community driver's histb_vdp_program_timing()
++ * [read histb-vdp.c:652-690]: HSYNC1 = (hdisp-1) | (hback+hsync-1) << 16,
++ * HSYNC2 = hfront-1, VSYNC = (vdisp-1) | (vback+vsync-1) << 12 |
++ * (vfront-1) << 22, PWR = (hsync-1) | (vsync-1) << 16.
++ * [measured] DHD0_CTRL = 0x80008010 on the box: enabled, progressive.
++ */
++int histb_vdp_hw_read_mode(struct histb_vdp *vdp, struct drm_display_mode *m)
++{
++	u32 ctrl = vdp_rd(vdp, VDP_DHD0_CTRL);
++	u32 hs1 = vdp_rd(vdp, VDP_DHD0_HSYNC1);
++	u32 hs2 = vdp_rd(vdp, VDP_DHD0_HSYNC2);
++	u32 vs = vdp_rd(vdp, VDP_DHD0_VSYNC);
++	u32 pwr = vdp_rd(vdp, VDP_DHD0_PWR);
++	u32 hact, hbb, hfb, hpw, vact, vbb, vfb, vpw;
++
++	if (!(ctrl & DHD0_CTRL_INTF_EN))
++		return -ENODEV;		/* the bootloader left no running display */
++	if (!(ctrl & DHD0_CTRL_IOP))
++		return -ENODEV;		/* interlaced: not adopted */
++
++	hact = FIELD_GET(GENMASK(15, 0), hs1) + 1;
++	hbb = FIELD_GET(GENMASK(31, 16), hs1) + 1;	/* back porch + sync */
++	hfb = FIELD_GET(GENMASK(15, 0), hs2) + 1;
++	hpw = FIELD_GET(GENMASK(15, 0), pwr) + 1;
++	vact = FIELD_GET(GENMASK(11, 0), vs) + 1;
++	vbb = FIELD_GET(GENMASK(21, 12), vs) + 1;
++	vfb = FIELD_GET(GENMASK(31, 22), vs) + 1;
++	vpw = FIELD_GET(GENMASK(31, 16), pwr) + 1;
++
++	if (hact < 320 || hact > HISTB_VDP_MAX_W ||
++	    vact < 240 || vact > HISTB_VDP_MAX_H ||
++	    hpw >= hbb || vpw >= vbb)
++		return -EINVAL;
++
++	memset(m, 0, sizeof(*m));
++	m->hdisplay = hact;
++	m->hsync_start = hact + hfb;
++	m->hsync_end = m->hsync_start + hpw;
++	m->htotal = hact + hfb + hbb;
++	m->vdisplay = vact;
++	m->vsync_start = vact + vfb;
++	m->vsync_end = m->vsync_start + vpw;
++	m->vtotal = vact + vfb + vbb;
++	/*
++	 * The register set holds no refresh rate.  60 Hz is assumed: it is only
++	 * used for vblank timestamping, and 1080p60 (htotal 2200, vtotal 1125)
++	 * gives exactly the CEA 148.5 MHz.  [inferred]
++	 */
++	m->clock = DIV_ROUND_CLOSEST_ULL((u64)m->htotal * m->vtotal * 60, 1000);
++	m->flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
++	m->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
++	drm_mode_set_name(m);
++
++	return 0;
++}
++
++/* The boot-logo framebuffer G0 is scanning out, for the aperture handoff. */
++bool histb_vdp_hw_boot_fb(struct histb_vdp *vdp, u32 *base, u32 *size)
++{
++	u32 ctrl = vdp_rd(vdp, VDP_G0_CTRL);
++	u32 stride = FIELD_GET(GENMASK(15, 0), vdp_rd(vdp, VDP_G0_STRIDE)) *
++		     G0_STRIDE_UNIT;
++	u32 height = FIELD_GET(GENMASK(23, 12), vdp_rd(vdp, VDP_G0_IRESO)) + 1;
++
++	if (!(ctrl & G0_CTRL_ENABLE) || !stride)
++		return false;
++
++	*base = vdp_rd(vdp, VDP_G0_ADDR);
++	*size = stride * height;
++	return true;
++}
++
++/* ---------------------------------------------------------------------- */
++/* boot snapshot                                                          */
++/* ---------------------------------------------------------------------- */
++
++void histb_vdp_hw_snapshot_boot(struct histb_vdp *vdp)
++{
++	struct histb_vdp_boot_g0 *b = &vdp->boot;
++
++	b->ctrl = vdp_rd(vdp, VDP_G0_CTRL);
++	b->addr = vdp_rd(vdp, VDP_G0_ADDR);
++	b->naddr = vdp_rd(vdp, VDP_G0_NADDR);
++	b->stride = vdp_rd(vdp, VDP_G0_STRIDE);
++	b->ireso = vdp_rd(vdp, VDP_G0_IRESO);
++	b->sfpos = vdp_rd(vdp, VDP_G0_SFPOS);
++	b->dfpos = vdp_rd(vdp, VDP_G0_DFPOS);
++	b->dlpos = vdp_rd(vdp, VDP_G0_DLPOS);
++	b->vfpos = vdp_rd(vdp, VDP_G0_VFPOS);
++	b->vlpos = vdp_rd(vdp, VDP_G0_VLPOS);
++	b->cbmpara = vdp_rd(vdp, VDP_G0_CBMPARA);
++	b->alpha = vdp_rd(vdp, VDP_G0_ALPHA);
++	b->cbm_mix1 = vdp_rd(vdp, VDP_CBM_MIX1);
++	b->vp0_ctrl = vdp_rd(vdp, VDP_VP0_CTRL);
++}
++
++static void latch_g0(struct histb_vdp *vdp)
++{
++	/*
++	 * G0 and GP0 each have a shadow latch and the graphics path observes a
++	 * complete pair; read each request back to flush the posted write
++	 * before issuing the next.  [read community histb-vdp.c:470-478]
++	 */
++	writel(1, vdp->base + VDP_G0_UPD);
++	readl(vdp->base + VDP_G0_UPD);
++	writel(1, vdp->base + VDP_GP0_UPD);
++	readl(vdp->base + VDP_GP0_UPD);
++}
++
++/* Put G0 and the video mixer back the way the bootloader left them. */
++void histb_vdp_hw_restore_boot(struct histb_vdp *vdp)
++{
++	const struct histb_vdp_boot_g0 *b = &vdp->boot;
++
++	histb_vdp_hw_v0_disable(vdp);
++
++	vdp_wr(vdp, VDP_G0_ADDR, b->addr);
++	vdp_wr(vdp, VDP_G0_NADDR, b->naddr);
++	vdp_wr(vdp, VDP_G0_STRIDE, b->stride);
++	vdp_wr(vdp, VDP_G0_IRESO, b->ireso);
++	vdp_wr(vdp, VDP_G0_SFPOS, b->sfpos);
++	vdp_wr(vdp, VDP_G0_DFPOS, b->dfpos);
++	vdp_wr(vdp, VDP_G0_DLPOS, b->dlpos);
++	vdp_wr(vdp, VDP_G0_VFPOS, b->vfpos);
++	vdp_wr(vdp, VDP_G0_VLPOS, b->vlpos);
++	vdp_wr(vdp, VDP_G0_CBMPARA, b->cbmpara);
++	vdp_wr(vdp, VDP_G0_ALPHA, b->alpha);
++	vdp_wr(vdp, VDP_G0_CTRL, b->ctrl);
++	vdp_wr(vdp, VDP_CBM_MIX1, b->cbm_mix1);
++	latch_g0(vdp);
++}
++
++/* ---------------------------------------------------------------------- */
++/* vertical interrupt                                                     */
++/* ---------------------------------------------------------------------- */
++
++void histb_vdp_hw_vblank(struct histb_vdp *vdp, bool on)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&vdp->irq_lock, flags);
++	vdp->vblank_on = on;
++	if (on) {
++		/* clear a stale status, fire at the first blanking line */
++		vdp_wr(vdp, VDP_VOMSKINTSTA, VDP_INT_DHD0_VTTHD1);
++		vdp_rmw(vdp, VDP_DHD0_VTTHD, GENMASK(12, 0) | BIT(15),
++			vdp->mode.vdisplay & GENMASK(12, 0));
++		vdp_wr(vdp, VDP_VOINTMSK, VDP_INT_DHD0_VTTHD1);
++	} else {
++		vdp_wr(vdp, VDP_VOINTMSK, 0);
++	}
++	spin_unlock_irqrestore(&vdp->irq_lock, flags);
++}
++
++/* ---------------------------------------------------------------------- */
++/* G0 - primary plane                                                     */
++/* ---------------------------------------------------------------------- */
++
++void histb_vdp_hw_g0_update(struct histb_vdp *vdp, struct drm_plane_state *state)
++{
++	struct drm_framebuffer *fb = state->fb;
++	u32 w = drm_rect_width(&state->src) >> 16;
++	u32 h = drm_rect_height(&state->src) >> 16;
++	u32 x = state->dst.x1;
++	u32 y = state->dst.y1;
++	bool has_alpha = fb->format->has_alpha;
++	dma_addr_t addr = drm_fb_dma_get_gem_addr(fb, state, 0);
++	u32 ctrl;
++
++	vdp_wr(vdp, VDP_G0_ADDR, lower_32_bits(addr));
++	vdp_wr(vdp, VDP_G0_NADDR, 0);
++	vdp_wr(vdp, VDP_G0_SMMU_BYPASS0, 3);
++	vdp_wr(vdp, VDP_G0_DCMP_ADDR, 0);
++	vdp_wr(vdp, VDP_G0_DCMP_NADDR, 0);
++	vdp_wr(vdp, VDP_G0_DCMP_OFFSET, 0);
++	vdp_wr(vdp, VDP_G0_STRIDE, fb->pitches[0] / G0_STRIDE_UNIT);
++	vdp_wr(vdp, VDP_G0_IRESO, VDP_SIZE(w, h));
++	vdp_wr(vdp, VDP_G0_SFPOS, 0);
++	vdp_wr(vdp, VDP_G0_DFPOS, VDP_POS(x, y));
++	vdp_wr(vdp, VDP_G0_DLPOS, VDP_POS(x + w - 1, y + h - 1));
++	vdp_wr(vdp, VDP_G0_VFPOS, VDP_POS(x, y));
++	vdp_wr(vdp, VDP_G0_VLPOS, VDP_POS(x + w - 1, y + h - 1));
++
++	/*
++	 * [measured] the bootloader's value is 0xCC00C368 = enable | nonsecure |
++	 * read/update progressive | req_ctrl 3 | bitext 3 | ifmt 0x68; these are
++	 * exactly the flags the community driver sets, so only ifmt differs.
++	 */
++	ctrl = vdp_rd(vdp, VDP_G0_CTRL);
++	ctrl &= ~G0_CTRL_IFMT;
++	ctrl |= FIELD_PREP(G0_CTRL_IFMT, has_alpha ? G0_IFMT_ARGB8888 :
++						       G0_IFMT_KRGB8888) |
++		FIELD_PREP(G0_CTRL_BITEXT, 3) | FIELD_PREP(G0_CTRL_REQ_CTRL, 3) |
++		G0_CTRL_READ_PROG | G0_CTRL_UPDATE_PROG | G0_CTRL_NONSECURE |
++		G0_CTRL_ENABLE;
++	vdp_wr(vdp, VDP_G0_CTRL, ctrl);
++
++	/* global alpha from the plane's "alpha" property; per-pixel alpha for ARGB */
++	vdp_wr(vdp, VDP_G0_CBMPARA,
++	       FIELD_PREP(G0_CBM_GALPHA, state->alpha >> 8) |
++	       (has_alpha ? G0_CBM_PALPHA_EN : 0));
++	vdp_wr(vdp, VDP_G0_ALPHA, 0xff);
++
++	wmb();	/* framebuffer pixels and the writes above before the latch */
++	latch_g0(vdp);
++}
++
++void histb_vdp_hw_g0_disable(struct histb_vdp *vdp)
++{
++	vdp_rmw(vdp, VDP_G0_CTRL, G0_CTRL_ENABLE, 0);
++	wmb();
++	latch_g0(vdp);
++}
++
++/* ---------------------------------------------------------------------- */
++/* V0 - video plane                                                       */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * One-time identity setup of the video colour core, as VDP_DRV_SetVidLayer()
++ * does it for V0/V1 on CV200 [read VT vdp_drv_vid.c:106-146]:
++ *  - VDM RGB2LMS: identity (coefficient 1, scale2p 0), enabled
++ *  - CVM_CTRL.cvm_sel = 0
++ *  - CVM1 LMS2IPT: enabled, scale2p 15 | 1<<5, identity = 1 * 2^10 * 2^(15-10) / 2
++ *    = 0x4000, out dc 0, min 0, max 0x7fff
++ * The community driver builds the same Q14 identity for the graphics CVM2.
++ */
++static void v0_chain_init(struct histb_vdp *vdp)
++{
++	unsigned int i;
++
++	if (vdp->v0_chain_ready)
++		return;
++
++	for (i = 0; i < 9; i++) {
++		vdp_wr(vdp, VDP_VDM_RGB2LMS_COEF(i), i % 4 == 0 ? 1 : 0);
++		vdp_wr(vdp, VDP_CVM1_LMS2IPT_COEF(i), i % 4 == 0 ? 0x4000 : 0);
++	}
++	vdp_wr(vdp, VDP_VDM_RGB2LMS_SCALE2P, 0);
++	vdp_wr(vdp, VDP_VDM_RGB2LMS_CTRL, 1);
++
++	vdp_rmw(vdp, VDP_CVM_CTRL, CVM_CTRL_SEL, 0);
++
++	vdp_wr(vdp, VDP_CVM1_LMS2IPT_SCALE2P, 15 | BIT(5));
++	for (i = 0; i < 3; i++)
++		vdp_wr(vdp, VDP_CVM1_LMS2IPT_OUT_DC(i), 0);
++	vdp_wr(vdp, VDP_CVM1_LMS2IPT_MIN, 0);
++	vdp_wr(vdp, VDP_CVM1_LMS2IPT_MAX, 0x7fff);
++	vdp_wr(vdp, VDP_CVM1_LMS2IPT_CTRL, 1);
++
++	vdp->v0_chain_ready = true;
++}
++
++/*
++ * YCbCr -> RGB matrices, Q10, rows R,G,B: computed from Kr/Kb (BT.601 0.299/
++ * 0.114, BT.709 0.2126/0.0722) with the 255/219 and 255/224 limited-range
++ * gains.  The vendor hands the PQ library's own table to the same registers
++ * with scale2p = 10 [read VT vdp_drv_vid.c:1455], and the PQ values are not in
++ * the tree, so "Q10 with scale2p 10" is [inferred] - the two module parameters
++ * csc_shift / csc_scale2p retune it without a rebuild.
++ */
++static const s16 csc_matrix[2][2][9] = {
++	[0] = {	/* BT.601 */
++		[0] = { 1192, 0, 1634, 1192, -401, -832, 1192, 2066, 0 },	/* limited */
++		[1] = { 1024, 0, 1436, 1024, -352, -731, 1024, 1815, 0 },	/* full */
++	},
++	[1] = {	/* BT.709 */
++		[0] = { 1192, 0, 1836, 1192, -218, -546, 1192, 2163, 0 },
++		[1] = { 1024, 0, 1613, 1024, -192, -479, 1024, 1900, 0 },
++	},
++};
++
++static void v0_program_csc(struct histb_vdp *vdp, enum drm_color_encoding enc,
++			   enum drm_color_range range)
++{
++	bool bt709 = enc != DRM_COLOR_YCBCR_BT601;
++	bool full = range == DRM_COLOR_YCBCR_FULL_RANGE;
++	const s16 *c = csc_matrix[bt709][full];
++	int sh = histb_vdp_csc_shift - 10;
++	/*
++	 * Input offsets: the PQ DC values are 10-bit domain (-64 / -512 for
++	 * limited YUV) and the vendor multiplies by 16 for the 14-bit VDM
++	 * register [read VT vdp_drv_vid.c:1419]: Y -16, C -128 in 8 bit.
++	 */
++	u32 dcy = full ? 0 : (u32)(-16 * 64) & GENMASK(13, 0);
++	u32 dcc = (u32)(-128 * 64) & GENMASK(13, 0);
++	unsigned int i;
++
++	for (i = 0; i < 9; i++) {
++		int v = sh >= 0 ? c[i] << sh : c[i] >> -sh;
++
++		vdp_wr(vdp, VDP_VDM_YUV2RGB_COEF(i), (u16)v);
++	}
++	vdp_wr(vdp, VDP_VDM_YUV2RGB_SCALE2P, histb_vdp_csc_scale2p);
++	vdp_wr(vdp, VDP_VDM_YUV2RGB_IN_DC(0), dcy);
++	vdp_wr(vdp, VDP_VDM_YUV2RGB_IN_DC(1), dcc);
++	vdp_wr(vdp, VDP_VDM_YUV2RGB_IN_DC(2), dcc);
++	for (i = 0; i < 3; i++)
++		vdp_wr(vdp, VDP_VDM_YUV2RGB_OUT_DC(i), 0);
++	/* V0 colour conversion on, V0 gamma off [read VT vdp_drv_vid.c:1436-1455] */
++	vdp_wr(vdp, VDP_VDM_YUV2RGB_CTRL, VDM_Y2R_EN | VDM_Y2R_V0_CSC_EN);
++	vdp_rmw(vdp, VDP_VDM_CTRL, 0, BIT(0));
++}
++
++static void v0_program_zme(struct histb_vdp *vdp, u32 sw, u32 sh, u32 dw, u32 dh)
++{
++	bool scaled = sw != dw || sh != dh;
++	u64 key = sw | ((u64)dw << 16) | ((u64)sh << 32) | ((u64)dh << 48);
++	u32 hsp, vsp;
++
++	/*
++	 * 1:1 runs the scaler with every luma/horizontal FIR in copy mode, the
++	 * way the BSP VPSS port does it for a 1:1 job [read histb-vpss.c:569-612].
++	 * The vertical chroma FIR stays on: it is the 4:2:0 -> 4:2:2 chroma
++	 * upsampler (zme_in_fmt 4:2:0, zme_out_fmt 4:2:2, chroma phase
++	 * -(4096 >> 2) >> 1 = -512) [read VT X	 * 1030-1050 VdpZmeComnSet].
++	 */
++	if (key != vdp->zme_key) {
++		histb_vdp_zme_load(vdp->zme_coef, sw, dw, sh, dh);
++		vdp->zme_key = key;
++		vdp_wr(vdp, VDP_V0_HLCOEFAD, lower_32_bits(vdp->zme_coef_dma));
++		vdp_wr(vdp, VDP_V0_HCCOEFAD,
++		       lower_32_bits(vdp->zme_coef_dma + 0x100) & ~0xfU);
++		vdp_wr(vdp, VDP_V0_VLCOEFAD, lower_32_bits(vdp->zme_coef_dma + 0x200));
++		vdp_wr(vdp, VDP_V0_VCCOEFAD,
++		       lower_32_bits(vdp->zme_coef_dma + 0x300) & ~0xfU);
++		wmb();
++		vdp_wr(vdp, VDP_V0_PARAUP,
++		       V0_PARAUP_HL | V0_PARAUP_HC | V0_PARAUP_VL | V0_PARAUP_VC);
++	}
++
++	hsp = FIELD_PREP(V0_HSP_HRATIO, div_u64(((u64)sw << 20), dw)) |
++	      V0_HSP_HFIR_ORDER | V0_HSP_HLMSC_EN | V0_HSP_HCHMSC_EN |
++	      (scaled ? V0_HSP_HLFIR_EN | V0_HSP_HCHFIR_EN : 0);
++	vsp = FIELD_PREP(V0_VSP_ZME_IN_FMT, 1) | FIELD_PREP(V0_VSP_ZME_OUT_FMT, 0) |
++	      V0_VSP_VLMSC_EN | V0_VSP_VCHMSC_EN | V0_VSP_VCHFIR_EN |
++	      (scaled ? V0_VSP_VLFIR_EN : 0);
++	vdp_wr(vdp, VDP_V0_HSP, hsp);
++	vdp_wr(vdp, VDP_V0_VSP, vsp);
++	vdp_wr(vdp, VDP_V0_VSR, div_u64(((u64)sh << 12), dh));
++	vdp_wr(vdp, VDP_V0_HLOFFSET, 0);
++	vdp_wr(vdp, VDP_V0_HCOFFSET, 0);
++	vdp_wr(vdp, VDP_V0_VOFFSET, (u16)-512);		/* chroma = low half, luma 0 */
++	vdp_wr(vdp, VDP_V0_VBOFFSET, (u16)-512);
++}
++
++void histb_vdp_hw_v0_update(struct histb_vdp *vdp, struct drm_plane_state *state)
++{
++	struct drm_framebuffer *fb = state->fb;
++	struct drm_gem_dma_object *gy = drm_fb_dma_get_gem_obj(fb, 0);
++	struct drm_gem_dma_object *gc = drm_fb_dma_get_gem_obj(fb, 1);
++	u32 sx = state->src.x1 >> 16, sy = state->src.y1 >> 16;
++	u32 sw = drm_rect_width(&state->src) >> 16;
++	u32 sh = drm_rect_height(&state->src) >> 16;
++	u32 dx = state->dst.x1, dy = state->dst.y1;
++	u32 dw = drm_rect_width(&state->dst), dh = drm_rect_height(&state->dst);
++	u32 W = vdp->mode.hdisplay, H = vdp->mode.vdisplay;
++	dma_addr_t ya, ca;
++	u32 ctrl;
++
++	/*
++	 * Vertical crop is done by the start address, horizontal crop by CPOS
++	 * (IRESO then spans the source line up to the crop's right edge)
++	 * [read VT vdp_drv_vid.c:495-660].  sy is even (checked), so the
++	 * half-height chroma plane starts on a whole line.
++	 */
++	ya = gy->dma_addr + fb->offsets[0] + (dma_addr_t)sy * fb->pitches[0];
++	ca = gc->dma_addr + fb->offsets[1] + (dma_addr_t)(sy / 2) * fb->pitches[1];
++
++	v0_chain_init(vdp);
++	v0_program_csc(vdp, state->color_encoding, state->color_range);
++
++	vdp_rmw(vdp, VDP_V0_PRERD, 0, V0_PRERD_EN);
++	vdp_wr(vdp, VDP_V0_16REGIONENL, 1);
++	vdp_rmw(vdp, VDP_V0_SMMU_BYPASS0, 0, 0xf);	/* regions 0,1 luma+chroma: no SMMU */
++
++	vdp_wr(vdp, VDP_V0_P0LADDR, lower_32_bits(ya));
++	vdp_wr(vdp, VDP_V0_P0CADDR, lower_32_bits(ca));
++	vdp_wr(vdp, VDP_V0_P0STRIDE,
++	       (fb->pitches[0] & 0xffff) | ((fb->pitches[1] & 0xffff) << 16));
++
++	vdp_wr(vdp, VDP_V0_IRESO, VDP_SIZE(sx + sw, sh));
++	vdp_wr(vdp, VDP_V0_CPOS, (sx & 0xfff) | (((sx + sw - 1) & 0xfff) << 12));
++	vdp_wr(vdp, VDP_V0_ORESO, VDP_SIZE(dw, dh));
++
++	v0_program_zme(vdp, sw, sh, dw, dh);
++
++	vdp_wr(vdp, VDP_V0_VFPOS, VDP_POS(dx, dy));
++	vdp_wr(vdp, VDP_V0_VLPOS, VDP_POS(dx + dw - 1, dy + dh - 1));
++	vdp_wr(vdp, VDP_V0_DFPOS, VDP_POS(dx, dy));
++	vdp_wr(vdp, VDP_V0_DLPOS, VDP_POS(dx + dw - 1, dy + dh - 1));
++	/* limited-range black in 10 bit YCbCr (Y 0x40, Cb/Cr 0x200) outside the picture */
++	vdp_wr(vdp, VDP_V0_BK, 0x04080200);
++	vdp_wr(vdp, VDP_V0_MUTE_BK, 0x04080200);
++	vdp_wr(vdp, VDP_V0_CBMPARA, 0xff);
++	vdp_wr(vdp, VDP_V0_ALPHA, 0xff);
++
++	ctrl = vdp_rd(vdp, VDP_V0_CTRL);
++	ctrl &= ~(V0_CTRL_IFMT | V0_CTRL_REQ_CTRL | V0_CTRL_UV_ORDER |
++		  V0_CTRL_CHM_RMODE | V0_CTRL_LM_RMODE | V0_CTRL_IFIR_MODE |
++		  V0_CTRL_FLIP | V0_CTRL_MUTE | V0_CTRL_DATA_WIDTH);
++	ctrl |= FIELD_PREP(V0_CTRL_IFMT, V0_IFMT_SP_420) |
++		FIELD_PREP(V0_CTRL_REQ_CTRL, 3) | V0_CTRL_NOSEC |
++		(fb->format->format == DRM_FORMAT_NV21 ? V0_CTRL_UV_ORDER : 0) |
++		FIELD_PREP(V0_CTRL_CHM_RMODE, 1) | FIELD_PREP(V0_CTRL_LM_RMODE, 1) |
++		FIELD_PREP(V0_CTRL_IFIR_MODE, 3) |
++		FIELD_PREP(V0_CTRL_DATA_WIDTH, 0) | V0_CTRL_SURFACE_EN;
++	vdp_wr(vdp, VDP_V0_CTRL, ctrl);
++
++	/* VP0 spans the whole display [read VT vdp_drv_vid.c:402-409] */
++	vdp_wr(vdp, VDP_VP0_IRESO, VDP_SIZE(W, H));
++	vdp_wr(vdp, VDP_VP0_DFPOS, 0);
++	vdp_wr(vdp, VDP_VP0_DLPOS, VDP_POS(W - 1, H - 1));
++	vdp_wr(vdp, VDP_VP0_VFPOS, 0);
++	vdp_wr(vdp, VDP_VP0_VLPOS, VDP_POS(W - 1, H - 1));
++	vdp_wr(vdp, VDP_VP0_GALPHA, 0xff);
++	vdp_rmw(vdp, VDP_VP0_CTRL, VP0_CTRL_MUTE, 0);
++
++	/*
++	 * Routing: V0 -> MIXV0 (value = layer id + 1) -> VP0, then VP0 below GP0
++	 * in the DHD0 mixer: CBM_MIX1 = VP0 | GP0 << 4 = 0x21, what
++	 * VDP_DRIVER_Initial() writes [read VT vdp_software_selfdefine.c:332-333].
++	 * The community graphics-only driver writes 0x02 instead.
++	 */
++	vdp_rmw(vdp, VDP_MIXV0_MIX, GENMASK(7, 0), 1);
++	vdp_wr(vdp, VDP_CBM_MIX1, CBM_LAYER_VP0 | (CBM_LAYER_GP0 << 4));
++
++	wmb();	/* video pixels, coefficient memory and the writes above before the latches */
++	writel(1, vdp->base + VDP_V0_UPD);
++	writel(1, vdp->base + VDP_VP0_UPD);
++	writel(1, vdp->base + VDP_HDR_UPD);
++}
++
++void histb_vdp_hw_v0_disable(struct histb_vdp *vdp)
++{
++	vdp_rmw(vdp, VDP_V0_CTRL, V0_CTRL_SURFACE_EN, 0);
++	vdp_wr(vdp, VDP_CBM_MIX1, vdp->boot.cbm_mix1);
++	wmb();
++	writel(1, vdp->base + VDP_V0_UPD);
++	writel(1, vdp->base + VDP_VP0_UPD);
++	writel(1, vdp->base + VDP_HDR_UPD);
++}
++
++/* ---------------------------------------------------------------------- */
++/* debugfs                                                                */
++/* ---------------------------------------------------------------------- */
++
++void histb_vdp_hw_dump(struct histb_vdp *vdp, struct seq_file *m)
++{
++	static const struct { const char *n; u32 off; } regs[] = {
++		{ "VOINTSTA", VDP_VOINTSTA }, { "VOINTMSK", VDP_VOINTMSK },
++		{ "DHD0_CTRL", VDP_DHD0_CTRL }, { "DHD0_VTTHD", VDP_DHD0_VTTHD },
++		{ "G0_CTRL", VDP_G0_CTRL }, { "G0_ADDR", VDP_G0_ADDR },
++		{ "G0_STRIDE", VDP_G0_STRIDE }, { "G0_IRESO", VDP_G0_IRESO },
++		{ "G0_CBMPARA", VDP_G0_CBMPARA },
++		{ "V0_CTRL", VDP_V0_CTRL }, { "V0_IRESO", VDP_V0_IRESO },
++		{ "V0_ORESO", VDP_V0_ORESO }, { "V0_CPOS", VDP_V0_CPOS },
++		{ "V0_P0LADDR", VDP_V0_P0LADDR }, { "V0_P0CADDR", VDP_V0_P0CADDR },
++		{ "V0_P0STRIDE", VDP_V0_P0STRIDE }, { "V0_HSP", VDP_V0_HSP },
++		{ "V0_VSP", VDP_V0_VSP }, { "V0_VSR", VDP_V0_VSR },
++		{ "V0_VFPOS", VDP_V0_VFPOS }, { "V0_VLPOS", VDP_V0_VLPOS },
++		{ "V0_DFPOS", VDP_V0_DFPOS }, { "V0_DLPOS", VDP_V0_DLPOS },
++		{ "V0_16REGIONENL", VDP_V0_16REGIONENL },
++		{ "VP0_CTRL", VDP_VP0_CTRL }, { "VP0_IRESO", VDP_VP0_IRESO },
++		{ "VP0_DLPOS", VDP_VP0_DLPOS },
++		{ "VDM_CTRL", VDP_VDM_CTRL }, { "VDM_YUV2RGB_CTRL", VDP_VDM_YUV2RGB_CTRL },
++		{ "VDM_YUV2RGB_COEF0", VDP_VDM_YUV2RGB_COEF(0) },
++		{ "VDM_YUV2RGB_SCALE2P", VDP_VDM_YUV2RGB_SCALE2P },
++		{ "VDM_RGB2LMS_CTRL", VDP_VDM_RGB2LMS_CTRL },
++		{ "CVM_CTRL", VDP_CVM_CTRL }, { "CVM1_LMS2IPT_CTRL", VDP_CVM1_LMS2IPT_CTRL },
++		{ "MIXV0_MIX", VDP_MIXV0_MIX }, { "CBM_MIX1", VDP_CBM_MIX1 },
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		seq_printf(m, "0x%04x %-22s 0x%08x\n", regs[i].off, regs[i].n,
++			   vdp_rd(vdp, regs[i].off));
++}
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp_zme.c
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Hi3798CV200 VDP video-layer scaler (ZME) coefficient memory.
++ *
++ * The VDP ZME is the same IP family as the VPSS ZME: the community histb-vpss
++ * driver (patch 0008) already drives it on this hardware, so its filter tables
++ * and its 10-bit / 16-bit packing are reused here.  The vendor VDP path gets
++ * its tables from the closed PQ library (DRV_PQ_GetVdpZmeCoef), so the VDP
++ * packing itself is [inferred] to be identical - NOT seen on hardware.
++ *
++ * At exactly 1:1 the layer runs the scaler with every FIR in copy mode (the
++ * way the BSP VPSS port does) and these tables are never consulted, except for
++ * the vertical chroma FIR that turns 4:2:0 chroma into 4:2:2.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++
++#include "histb_vdp.h"
++
++/* 17 stored phases; the hardware mirrors the other 15. [read histb-vpss.c:309] */
++static const s16 histb_vdp_zme_hl8_up[17][8] = {
++	{ 4, -22, 40, 468, 40, -22, 4, 0 },
++	{ 3, -18, 26, 468, 54, -26, 5, 0 },
++	{ 2, -14, 14, 466, 68, -30, 6, 0 },
++	{ 2, -11, 2, 462, 84, -34, 7, 0 },
++	{ 1, -7, -9, 457, 100, -38, 8, 0 },
++	{ 1, -4, -18, 450, 116, -42, 9, 0 },
++	{ 1, -2, -27, 443, 133, -46, 10, 0 },
++	{ 0, 2, -35, 434, 151, -50, 10, 0 },
++	{ 0, 4, -42, 425, 168, -54, 11, 0 },
++	{ 0, 6, -49, 414, 186, -57, 12, 0 },
++	{ 0, 8, -54, 401, 204, -60, 13, 0 },
++	{ 0, 10, -58, 387, 222, -62, 13, 0 },
++	{ 0, 11, -62, 374, 240, -65, 14, 0 },
++	{ 0, 12, -65, 359, 258, -66, 14, 0 },
++	{ 0, 13, -67, 344, 276, -68, 14, 0 },
++	{ 0, 14, -68, 327, 293, -68, 14, 0 },
++	{ 0, 14, -68, 310, 310, -68, 14, 0 },
++};
++
++static const s16 histb_vdp_zme_hl8_exact[17][8] = {
++	{ 0, 0, 0, 511, 0, 0, 0, 0 },
++	{ -1, 3, -12, 511, 14, -4, 1, 0 },
++	{ -2, 6, -23, 509, 28, -8, 2, 0 },
++	{ -2, 9, -33, 503, 44, -12, 3, 0 },
++	{ -3, 11, -41, 496, 61, -16, 4, 0 },
++	{ -3, 13, -48, 488, 79, -21, 5, -1 },
++	{ -3, 14, -54, 477, 98, -25, 7, -2 },
++	{ -4, 16, -59, 465, 118, -30, 8, -2 },
++	{ -4, 17, -63, 451, 138, -35, 9, -1 },
++	{ -4, 18, -66, 437, 158, -39, 10, -2 },
++	{ -4, 18, -68, 421, 180, -44, 11, -2 },
++	{ -4, 18, -69, 404, 201, -48, 13, -3 },
++	{ -4, 18, -70, 386, 222, -52, 14, -2 },
++	{ -4, 18, -70, 368, 244, -56, 15, -3 },
++	{ -4, 18, -69, 348, 265, -59, 16, -3 },
++	{ -4, 18, -67, 329, 286, -63, 16, -3 },
++	{ -3, 17, -65, 307, 307, -65, 17, -3 },
++};
++
++static const s16 histb_vdp_zme_hl8_mid[17][8] = {
++	{ -16, 0, 145, 254, 145, 0, -16, 0 },
++	{ -16, -2, 140, 253, 151, 3, -17, 0 },
++	{ -15, -5, 135, 253, 157, 5, -18, 0 },
++	{ -14, -7, 129, 252, 162, 8, -18, 0 },
++	{ -13, -9, 123, 252, 167, 11, -19, 0 },
++	{ -13, -11, 118, 250, 172, 15, -19, 0 },
++	{ -12, -12, 112, 250, 177, 18, -20, -1 },
++	{ -11, -14, 107, 247, 183, 21, -20, -1 },
++	{ -10, -15, 101, 245, 188, 25, -21, -1 },
++	{ -9, -16, 96, 243, 192, 29, -21, -2 },
++	{ -8, -18, 90, 242, 197, 33, -22, -2 },
++	{ -8, -19, 85, 239, 202, 37, -22, -2 },
++	{ -7, -19, 80, 236, 206, 41, -22, -3 },
++	{ -7, -20, 75, 233, 210, 46, -22, -3 },
++	{ -6, -21, 69, 230, 215, 50, -22, -3 },
++	{ -5, -21, 65, 226, 219, 55, -22, -5 },
++	{ -5, -21, 60, 222, 222, 60, -21, -5 },
++};
++
++static const s16 histb_vdp_zme_hl8_low[17][8] = {
++	{ -18, 18, 144, 226, 144, 19, -17, -4 },
++	{ -17, 16, 139, 226, 148, 21, -17, -4 },
++	{ -17, 13, 135, 227, 153, 24, -18, -5 },
++	{ -17, 11, 131, 226, 157, 27, -18, -5 },
++	{ -17, 9, 126, 225, 161, 30, -17, -5 },
++	{ -16, 6, 122, 225, 165, 33, -17, -6 },
++	{ -16, 4, 118, 224, 169, 37, -17, -7 },
++	{ -16, 2, 113, 224, 173, 40, -17, -7 },
++	{ -15, 0, 109, 222, 177, 43, -17, -7 },
++	{ -15, -1, 104, 220, 181, 47, -16, -8 },
++	{ -14, -3, 100, 218, 185, 51, -16, -9 },
++	{ -14, -5, 96, 217, 188, 54, -15, -9 },
++	{ -14, -6, 91, 214, 192, 58, -14, -9 },
++	{ -13, -7, 87, 212, 195, 62, -14, -10 },
++	{ -13, -9, 83, 210, 198, 66, -13, -10 },
++	{ -12, -10, 79, 207, 201, 70, -12, -11 },
++	{ -12, -11, 74, 205, 205, 74, -11, -12 },
++};
++
++static const s16 histb_vdp_zme_4t_exact[17][4] = {
++	{ 0, 511, 0, 0 }, { -19, 511, 21, -1 },
++	{ -37, 509, 42, -2 }, { -51, 504, 64, -5 },
++	{ -64, 499, 86, -9 }, { -74, 492, 108, -14 },
++	{ -82, 484, 129, -19 }, { -89, 474, 152, -25 },
++	{ -94, 463, 174, -31 }, { -97, 451, 196, -38 },
++	{ -98, 438, 217, -45 }, { -98, 424, 238, -52 },
++	{ -98, 409, 260, -59 }, { -95, 392, 280, -65 },
++	{ -92, 376, 300, -72 }, { -88, 358, 320, -78 },
++	{ -83, 339, 339, -83 },
++};
++
++static const s16 histb_vdp_zme_4t_mid[17][4] = {
++	{ 103, 335, 103, -29 },
++	{ 92, 335, 112, -27 },
++	{ 84, 335, 121, -28 },
++	{ 75, 334, 131, -28 },
++	{ 67, 332, 141, -28 },
++	{ 59, 329, 152, -28 },
++	{ 51, 326, 162, -27 },
++	{ 43, 323, 173, -27 },
++	{ 36, 319, 183, -26 },
++	{ 30, 313, 194, -25 },
++	{ 23, 308, 204, -23 },
++	{ 17, 301, 215, -21 },
++	{ 12, 295, 225, -20 },
++	{ 6, 288, 235, -17 },
++	{ 2, 280, 244, -14 },
++	{ -3, 271, 254, -10 },
++	{ -7, 263, 263, -7 },
++};
++
++static const s16 histb_vdp_zme_4t_low[17][4] = {
++	{ 120, 281, 120, -9 }, { 113, 281, 127, -9 },
++	{ 106, 280, 134, -8 }, { 99, 279, 141, -7 },
++	{ 92, 277, 148, -5 }, { 85, 275, 156, -4 },
++	{ 79, 273, 162, -2 }, { 72, 270, 170, 0 },
++	{ 66, 267, 177, 2 }, { 61, 263, 184, 4 },
++	{ 56, 259, 191, 6 }, { 50, 255, 198, 9 },
++	{ 44, 251, 205, 12 }, { 40, 246, 211, 15 },
++	{ 34, 241, 218, 19 }, { 31, 235, 224, 22 },
++	{ 26, 230, 230, 26 },
++};
++
++static u32 pack10(s16 c0, s16 c1, s16 c2)
++{
++	return ((u16)c0 & GENMASK(9, 0)) |
++	       (((u16)c1 & GENMASK(9, 0)) << 10) |
++	       (((u16)c2 & GENMASK(9, 0)) << 20);
++}
++
++static u32 pack16(s16 c0, s16 c1)
++{
++	return (u16)c0 | (u32)(u16)c1 << 16;
++}
++
++static void put_hl8(__le32 *dst, const s16 coef[17][8])
++{
++	unsigned int ph;
++
++	for (ph = 0; ph < 17; ph++) {
++		const s16 *c = coef[ph];
++
++		dst[ph * 3] = cpu_to_le32(pack10(c[0], c[1], c[2]));
++		dst[ph * 3 + 1] = cpu_to_le32(pack10(c[3], c[4], c[5]));
++		dst[ph * 3 + 2] = cpu_to_le32(pack10(c[6], c[7], 0));
++	}
++}
++
++static void put_4t(__le32 *dst, const s16 coef[17][4])
++{
++	unsigned int ph;
++
++	for (ph = 0; ph < 17; ph++) {
++		dst[ph * 2] = cpu_to_le32(pack16(coef[ph][0], coef[ph][1]));
++		dst[ph * 2 + 1] = cpu_to_le32(pack16(coef[ph][2], coef[ph][3]));
++	}
++}
++
++static const s16 (*pick_hl8(unsigned int in, unsigned int out))[8]
++{
++	if (out > in)
++		return histb_vdp_zme_hl8_up;
++	if (out == in)
++		return histb_vdp_zme_hl8_exact;
++	if ((u64)out * 2 >= in)
++		return histb_vdp_zme_hl8_mid;
++	return histb_vdp_zme_hl8_low;
++}
++
++static const s16 (*pick_4t(unsigned int in, unsigned int out))[4]
++{
++	if (out == in)
++		return histb_vdp_zme_4t_exact;
++	if (out > in || (u64)out * 2 >= in)
++		return histb_vdp_zme_4t_mid;
++	return histb_vdp_zme_4t_low;
++}
++
++/*
++ * Fill the 1 KiB coefficient window for one in -> out ratio:
++ *   +0x000 HL (8-tap luma H)   +0x100 HC (4-tap chroma H)
++ *   +0x200 VL (luma V)         +0x300 VC (4-tap chroma V)
++ * VL is a 6-tap table in the vendor path; its packing is unknown, so it is
++ * filled with the 4-tap packing and is only meaningful at 1:1 where the luma
++ * vertical FIR is off.  [inferred]
++ */
++void histb_vdp_zme_load(void *coef, unsigned int in_w, unsigned int out_w,
++			unsigned int in_h, unsigned int out_h)
++{
++	u8 *p = coef;
++
++	memset(p, 0, 0x400);
++	put_hl8((__le32 *)(p + 0x000), pick_hl8(in_w, out_w));
++	put_4t((__le32 *)(p + 0x100), pick_4t(in_w, out_w));
++	put_4t((__le32 *)(p + 0x200), pick_4t(in_h, out_h));
++	put_4t((__le32 *)(p + 0x300), pick_4t(in_h, out_h));
++}

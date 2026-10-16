@@ -1,0 +1,102 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: crg-hi3798cv200 - add the VDEC and VPSS clocks
+
+The Hi3798CV200 video decoder (histb-vdec) needs three gates and the post-
+processing engine (histb-vpss) one gate plus a rate mux; mainline's CRG driver
+registers none of them.
+
+  CRG 0x78 bit 0  clk_vdh       VDH decode engine         HISTB_VDH_CLK      57
+  CRG 0x78 bit 1  clk_vdh_dsp   SCD DSP                   HISTB_VDH_DSP_CLK  58
+  CRG 0x88 bit 0  clk_bpd       bit-plane decoder (VC-1)  HISTB_BPD_CLK      59
+  CRG 0xf0 bit 0  clk_vpss      VPSS core                 HISTB_VPSS_CLK     60
+  CRG 0xf0 [9:8]  vpss_mux      333 / 400 / 300 MHz       inner id 89
+
+The community 6.12 tree numbers these 65..67 and 89.  That range overlaps this
+tree's inner-clock window (HI3798CV200_INNER_CLK_OFFSET 64), so the public ids
+take the free slots after SDIO1 (55-56) instead.  The 300/333/400 MHz fixed-rate
+parents the VPSS mux needs were defined but never registered here; 333 MHz is
+new (inner id 88).
+
+Keeps 0001 (SATA 51-54) and 0006 (SDIO1 55-56) untouched.
+
+diff --git a/drivers/clk/hisilicon/crg-hi3798cv200.c b/drivers/clk/hisilicon/crg-hi3798cv200.c
+index 72d7ab6e3..273fd89f8 100644
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -39,6 +39,8 @@
+ #define HI3798CV200_SDIO0_MUX			85
+ #define HI3798CV200_COMBPHY0_MUX		86
+ #define HI3798CV200_SDIO1_MUX			87
++#define HI3798CV200_FIXED_333M			88
++#define HI3798CV200_VPSS_MUX			89
+ 
+ #define HI3798CV200_CRG_NR_CLKS			128
+ 
+@@ -58,6 +60,9 @@ static const struct hisi_fixed_rate_clock hi3798cv200_fixed_rate_clks[] = {
+ 	{ HI3798CV200_FIXED_166P5M, "166p5m", NULL, 0, 165000000, },
+ 	{ HI3798CV200_FIXED_200M, "200m", NULL, 0, 200000000, },
+ 	{ HI3798CV200_FIXED_250M, "250m", NULL, 0, 250000000, },
++	{ HI3798CV200_FIXED_300M, "300m", NULL, 0, 300000000, },
++	{ HI3798CV200_FIXED_333M, "333m", NULL, 0, 333000000, },
++	{ HI3798CV200_FIXED_400M, "400m", NULL, 0, 400000000, },
+ };
+ 
+ static const char *const mmc_mux_p[] = {
+@@ -72,6 +77,9 @@ static const char *const sdio_mux_p[] = {
+ 		"100m", "50m", "150m", "166p5m" };
+ static u32 sdio_mux_table[] = {0, 1, 2, 3};
+ 
++static const char *const vpss_mux_p[] = { "333m", "400m", "300m" };
++static u32 vpss_mux_table[] = { 0, 1, 2 };
++
+ static struct hisi_mux_clock hi3798cv200_mux_clks[] = {
+ 	{ HI3798CV200_MMC_MUX, "mmc_mux", mmc_mux_p, ARRAY_SIZE(mmc_mux_p),
+ 		CLK_SET_RATE_PARENT, 0xa0, 8, 3, 0, mmc_mux_table, },
+@@ -87,6 +95,9 @@ static struct hisi_mux_clock hi3798cv200_mux_clks[] = {
+ 	{ HI3798CV200_SDIO1_MUX, "sdio1_mux", sdio_mux_p,
+ 		ARRAY_SIZE(sdio_mux_p), CLK_SET_RATE_PARENT,
+ 		0x28c, 8, 2, 0, sdio_mux_table, },
++	{ HI3798CV200_VPSS_MUX, "vpss_mux", vpss_mux_p,
++		ARRAY_SIZE(vpss_mux_p), CLK_SET_RATE_PARENT,
++		0xf0, 8, 2, 0, vpss_mux_table, },
+ };
+ 
+ static u32 mmc_phase_regvals[] = {0, 1, 2, 3, 4, 5, 6, 7};
+@@ -119,6 +130,16 @@ static const struct hisi_gate_clock hi3798cv200_gate_clks[] = {
+ 	/* SPI */
+ 	{ HISTB_SPI0_CLK, "clk_spi0", "clk_apb",
+ 		CLK_SET_RATE_PARENT, 0x70, 0, 0, },
++	/* Video decoder: the clock-select field of CRG 0x78 is driven by histb-vdec itself */
++	{ HISTB_VDH_CLK, "clk_vdh", NULL,
++		0, 0x78, 0, 0, },
++	{ HISTB_VDH_DSP_CLK, "clk_vdh_dsp", NULL,
++		0, 0x78, 1, 0, },
++	{ HISTB_BPD_CLK, "clk_bpd", NULL,
++		0, 0x88, 0, 0, },
++	/* Video post-processing subsystem */
++	{ HISTB_VPSS_CLK, "clk_vpss", "vpss_mux",
++		CLK_SET_RATE_PARENT, 0xf0, 0, 0, },
+ 	/* SDIO */
+ 	{ HISTB_SDIO0_BIU_CLK, "clk_sdio0_biu", "200m",
+ 			CLK_SET_RATE_PARENT, 0x9c, 0, 0, },
+diff --git a/include/dt-bindings/clock/histb-clock.h b/include/dt-bindings/clock/histb-clock.h
+index ef8cd2a2a..2d1f5d18d 100644
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -72,6 +72,17 @@
+ #define HISTB_SDIO1_BIU_CLK		55
+ #define HISTB_SDIO1_CIU_CLK		56
+ 
++/*
++ * Video decoder (VDH/SCD/MFD gates in CRG 0x78, BPD in 0x88) and the
++ * post-processing engine (VPSS, CRG 0xf0).  The community 6.12 tree numbers
++ * these 65..67 and 89, which collides with our inner-clock window; they take
++ * the free public ids 57..60 here instead.
++ */
++#define HISTB_VDH_CLK			57
++#define HISTB_VDH_DSP_CLK		58
++#define HISTB_BPD_CLK			59
++#define HISTB_VPSS_CLK			60
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2

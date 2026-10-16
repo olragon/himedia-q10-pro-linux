@@ -1,0 +1,20 @@
+# Q10: load SATA after boot, each module under the SP805 (q10-modprobe-guarded).
+# Not loaded by udev (blacklisted in /etc/modprobe.d/q10-sata.conf): a driver that hangs the
+# only CPU would otherwise be unguarded. Runs after the boot safety net is disarmed and sshd is
+# up, so a failure here never costs ssh.
+[Unit]
+Description=Q10: load the SATA driver under the watchdog
+After=q10-watchdog-off.service ssh.service
+Requires=q10-watchdog-off.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/q10-modprobe-guarded phy_histb_combphy 45
+ExecStart=/usr/local/sbin/q10-modprobe-guarded ahci_platform 60 40
+# vendor SATA PHY tuning + one retrain: mainline's combphy init leaves the receiver marginal
+# (BadCRC/10B8B, hard resets). docs/261014-himedia-sata-kernel-vs-board.md
+ExecStartPost=/usr/local/sbin/q10-sata-phy-tune
+
+[Install]
+WantedBy=multi-user.target

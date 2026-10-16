@@ -1,0 +1,37 @@
+LOCAL PATCH (not submitted anywhere): phy: hisilicon: histb-combphy — SATA-mode nano tuning
+
+histb_combphy_init() writes the vendor's PCIe tuning (nano[0x1]=0x8, [0xc]=0x9, [0x1a]=0x4) in
+every mode. On the HiMedia Q10 Pro (Hi3798CV200, combphy1 in SATA mode) that leaves the SATA
+receiver marginal: 10B8B/BadCRC on an idle link (4-33 error-seconds a minute), and under a 2 GB
+read 6 exceptions + 6 hard resets + a drop to UDMA/100. The vendor SATA driver (hiahci-phy, stock
+3.18) writes nano[0x1]=0x4 only; with it: 0 error-seconds, and 2 GB reads + a 1 GB rewrite with
+CRC +0 / 0 resets. A sweep of nano[0x1]: 2, 4, 6 clean, bit 3 set errs.
+
+The value has to be in place before the first link training. Applying it from userspace after
+the driver trained the link blips the PHY (PHYRdyChg), and with root I/O in flight libata's
+recovery failed (IDENTIFY timeouts, device disabled, ext4 journal aborted).
+docs/261014-himedia-sata-kernel-vs-board.md
+
+--- a/drivers/phy/hisilicon/phy-histb-combphy.c
++++ b/drivers/phy/hisilicon/phy-histb-combphy.c
+@@ -131,6 +131,20 @@
+ 
+ 	/* Need to wait for EP clock stable */
+ 	mdelay(5);
++
++	/*
++	 * LOCAL (HiMedia Q10 Pro / Hi3798CV200): the values below are the vendor's PCIe tuning
++	 * (Poplar). In SATA mode nano[0x1] = 0x8 leaves the receiver marginal: 10B8B/BadCRC on an
++	 * idle link, hard resets and UDMA/100 under load (measured 2026-10-14). The vendor SATA
++	 * driver (hiahci-phy) writes nano[0x1] = 0x4 and nothing else here; with it the link is
++	 * clean. It must be set HERE, before the first link training: retuning a live link blips
++	 * the PHY, and under root I/O that wedged the disk.
++	 */
++	if (priv->mode.select == PHY_TYPE_SATA) {
++		nano_register_write(priv, 0x1, 0x4);
++		dev_info(&phy->dev, "SATA mode: nano[0x1] = 0x4 (vendor SATA tuning)\n");
++		return 0;
++	}
+ 
+ 	/* Configure nano phy registers as suggested by vendor */
+ 	nano_register_write(priv, 0x1, 0x8);

@@ -1,0 +1,12 @@
+# The chained kernel reached multi-user: clear the failure counter so the next cold boot chains again.
+[Unit]
+Description=Q10: confirm the chained kernel came up
+ConditionKernelCommandLine=q10.chained
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/q10-kexec-chain ok
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+# Q10 Pro (Mali-T720, Panfrost): Mesa exposes OpenGL ES 2.0 only, and Android 13's SkiaGL
+# RenderEngine crashes in libgallium_dri on it (SurfaceFlinger SIGSEGV loop, 2026-10-12).
+# The same override made Chromium's GPU path work on this GPU (11.7 -> 38 fps, 0 faults).
+# Mesa reads it from the ENVIRONMENT (a debug.mesa_* property is not consulted for it), so
+# init exports it globally before any service starts. Installed by waydroid-install.sh into
+# /var/lib/waydroid/overlay/vendor/etc/init/.
+on early-init
+    export MESA_GLES_VERSION_OVERRIDE 3.0

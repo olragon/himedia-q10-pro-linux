@@ -1,0 +1,25 @@
+# Q10 session: Kodi (GBM, v4l2request decode). Needs DRM master, so it Conflicts with the other sessions.
+[Unit]
+Description=Q10 session: Kodi
+Requires=q10-video-stack.service
+After=q10-video-stack.service systemd-user-sessions.service
+Conflicts=q10-desktop.service q10-web.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Environment=HOME=/root KODI_DATA=/var/lib/q10/kodi KODI_V4L2REQ_PRESET=direct
+ExecStartPre=/bin/mkdir -p /var/lib/q10/kodi/userdata
+# The wrapper's preset has loglevel 1 (debug + on-screen overlay) for bench runs; the session
+# profile is for watching, so it gets its own quiet one (kept if someone edits it).
+ExecStartPre=/bin/sh -c '[ -e /var/lib/q10/kodi/userdata/advancedsettings.xml ] || printf "<advancedsettings version=\\"1.0\\">\\n  <loglevel>0</loglevel>\\n</advancedsettings>\\n" > /var/lib/q10/kodi/userdata/advancedsettings.xml'
+ExecStartPre=/bin/sh -c 'echo 3 > /proc/sys/kernel/printk'
+ExecStart=/usr/local/bin/kodi-v4l2req
+ExecStopPost=/bin/sh -c 'echo 7 > /proc/sys/kernel/printk'
+ExecStopPost=-/usr/local/sbin/q10-mode exited kodi
+Restart=on-failure
+RestartSec=3
+# Kodi 21 ignores SIGTERM for >20 s when it holds DRM master (measured 2026-10-12); a
+# stop that ends in SIGKILL only loses unsaved GUI changes. Not OnFailure-wired: a
+# switch would otherwise re-open the menu over the session it just started.
+TimeoutStopSec=8

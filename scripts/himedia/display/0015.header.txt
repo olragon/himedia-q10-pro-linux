@@ -1,0 +1,38 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: hi3798cv200 - HDMI pixel clock (HPLL) and the HDMI transmitter gates
+
+The Hi3798CV200 HDMI pixel clock is the HPLL (CRG 0x28/0x2c), the VO_HD divider (CRG 0xd8
+bits 19:18) and a pixel gate (CRG 0x278 bit 2).  Mainline has none of it, so no driver could
+change the display mode.  This adds, ported from the community histb-linux 6.12.y tree
+(crg-hi3798cv200.c, hi3798cv200_hdmi_pixel_*):
+
+  clk_hdmi_pixel   a clk_hw with 26 PLL presets that are word for word rows of the vendor 4.4.35
+                   kernel's display format table (decoded by scripts/himedia/display/stock-fmt-table.py),
+                   a solver for any other rate, and a rollback to the previous PLL words when the
+                   new plan does not lock
+  clk_hdmi_*       eight simple gates: CRG 0x10c bits 0..5 (bus, cec, id, mhl, os, as) and
+                   CRG 0x278 bits 0/1 (x, pixel_nx)
+
+Public ids 110..118 (the community tree numbers them 78..86, which collide with this tree's
+inner-clock window 64..89).  hisi_clk_lock is made global so the pixel clock's read-modify-writes
+of CRG 0xd8 / 0x278 are serialised with the gates that share those words.
+
+Differences from the community code - the bootloader's HDMI link is running when this registers
+and must not be disturbed until a consumer asks for a rate:
+
+  * .prepare does nothing.  The community .prepare re-programs the PLL whenever its words differ
+    from the preset for the current rate; the boot words (14e6ae6a/00001062, 148.352 MHz) are an
+    equivalent plan that is NOT a preset row, so registering the clock as critical or the first
+    clk_prepare() would have rewritten the PLL at boot.
+  * CLK_IGNORE_UNUSED on the pixel clock and on all eight gates, so clk_disable_unused() leaves a
+    link nobody has claimed yet alone.  No register is written at registration.
+  * clk_set_rate() writes the two HPLL words and the VO_HD divider field only; the source-select
+    bits (VO_HD_CLK_SEL, HDMI_CLK_SEL, ...) are checked and a mismatch is logged, never written.
+  * the lock wait starts 100 us after the write (the lock bit still shows the OLD lock for a
+    moment) and gives the PLL 10 ms.  On timeout every register is restored and the old PLL is
+    given time to relock; the error goes back to the caller.
+  * one dev_info at registration prints HPLL, lock and CRG54/67/158/211 as the bootloader left
+    them: `dmesg | grep "HDMI pixel clock"`.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain), W=1.
+Needs 0001..0012.
+

@@ -1,0 +1,39 @@
+LOCAL PATCH (not submitted anywhere): drm/bridge: histb-hdmi: add a CEC adapter for the HDMI transmitter
+
+HDMI CEC for the Hi3798CV200 (HiMedia Q10 Pro), on top of 0016/0017.
+
+The CEC engine is the "CPI" block of the Silicon Image "imagev200" core: page 0xf of the TX register
+file, i.e. 0xf8ce3c00 + 4 * reg (reg 0x80..0xe4) inside the 0xf8ce0000 window the bridge already maps.
+There is no separate ioremap, reset or CRG block; its gate is the "cec" clock (CRG 0x10c bit 1) that
+0015/0016 already enable, and SPI 147 ("cec") is its interrupt.  A single TX buffer (opcode + 15
+operands), a 3-frame RX FIFO, a 16-bit capture-address mask.  Register map, bit meanings and the
+sequence all come from the vendor SDK (hdmi_2_0/hal/ctrl/imagev200/hal_cec.c, driver/cpi/si_drv_cpi.c,
+si_drv_tx_regs.h) and were cross-checked against the stock 3.18 kernel (CPI base 0x3f00 passed by
+HAL_HDMI_Open -> SiiCecDeviceCreate).
+
+The adapter is NOT hand-registered: the bridge sets DRM_BRIDGE_OP_HDMI_CEC_ADAPTER and implements
+hdmi_cec_{init,enable,log_addr,transmit}; drm_bridge_connector (which histb_vdp already uses) calls
+drmm_connector_hdmi_cec_register(), so the physical address is taken from the sink's EDID by
+drm_edid_connector_update() and the adapter gets CEC_CAP_RC (with MEDIA_CEC_RC, the TV remote's
+User Control keys become an rc-cec input device).  Received frames and transmit results go back
+through drm_connector_hdmi_cec_received_msg() / _transmit_attempt_done().
+
+Behaviour:
+
+  * Polled, like the vendor driver (it polls INT_STATUS from a 100 ms timer): every 20 ms while the
+    adapter is enabled, every 5 ms while a frame is on the wire.  cec_irq=1 additionally requests
+    SPI 147 (polarity unverified) to bring the poll forward; the poll stays as the safety net.
+  * The CEC core does the retries: the hardware retry limit is 0 and a missing acknowledge (the
+    "retry count exceeded" status) is reported as CEC_TX_STATUS_NACK.  Success is declared only
+    after the frame can have ended AND the TX-empty/changed status latched, because the vendor's
+    "acknowledged" bit is not proven to mean "completed".  The TX buffer is flushed before the retry
+    status is cleared, as the vendor does, or the frame is re-sent.
+  * Probe only READS the block (id 0xcc, spec, revision, line level): the adopted-link rule of 0016
+    holds.  A takeover of the link (bus/core reset) clears the block; hw_init re-applies the enabled
+    state through histb_hdmi_cec_restore().
+  * Fallback: cec=0 never registers an adapter and never touches the CEC registers.
+  * debugfs /sys/kernel/debug/histb-hdmi/cec: block id, wire level, start-bit timer, ids, status.
+  * Not supported: --monitor-all (the DRM helper's adapter has no monitor_all op), more than one
+    logical address.
+
+Not tested on hardware.  Needs 0016 (and 0015/0017 for the display it lives next to).

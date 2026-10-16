@@ -1,0 +1,7 @@
+{
+  "name": "vn.himedia.mpv_hw",
+  "description": "Hand web video to the hardware-decoding mpv (Q10 Pro)",
+  "path": "@HOST_PATH@",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://@EXT_ID@/"]
+}

@@ -1,0 +1,38 @@
+LOCAL PATCH (not submitted anywhere): drm: hisilicon: histb-vdp - adopt the bootloader display, add an NV12 video plane
+
+A KMS driver for the Hi3798CV200 video display processor (VDP, 0xf8cc0000) whose
+goal is "decoder -> display controller" playback: the histb-vdec V4L2 decoder
+exports NV12 dma-bufs from CMA and the V0 video layer scans them out directly.
+
+  primary plane  "G0"  XRGB8888 / ARGB8888, any CMA buffer (global "alpha" property)
+  overlay plane  "V0"  NV12 / NV21, source crop, window position, BT.601/709 and
+                       limited/full range ("COLOR_ENCODING"/"COLOR_RANGE"); 1:1 by
+                       default, ZME scaling behind the allow_scale=1 module parameter
+  CRTC   "DHD0"  one fixed mode, READ BACK from the running DHD0 registers
+  connector      HDMI-A, always connected, one mode, no DDC
+
+It differs from the community 6.12 histb-vdp driver in what it refuses to do: it
+never writes DHD0 timing, never touches the CRG or the HDMI block, never soft-resets
+the VDP (the bootloader's 1080p60 HDMI link has to keep running - nothing here can
+retrain it) and never rewrites the G0 -> GP0 -> CBM route.  Its write set is G0, V0,
+VP0, the video colour core (VDM / CVM1) and CBM_MIX1; see histb_vdp_hw.c.  The only
+mixer change is CBM_MIX1 = VP0 | GP0 << 4 (what the vendor writes) so V0 reaches the
+output; the bootloader's value is restored when V0 goes away or the module is removed.
+
+simpledrm hand-over: an aperture_remove_conflicting_devices() over the boot
+framebuffer's address range evicts it at probe.  The reserved-memory region is not
+touched.  On module removal G0 is pointed back at that region; simpledrm does NOT
+re-probe by itself.
+
+Provenance: graphics layer and IRQ from the community histb-vdp.c; the video layer
+from the vendor 4.4.35 SDK (drivers/msp/drv/vo/vdp_v4_0, hi_reg_vdp.h); the ZME
+coefficient tables from the community histb-vpss driver (patch 0008).  Every claim
+is tagged [read]/[inferred]/[measured] in the sources.  Several V0 values come out of
+the vendor's closed PQ library and are [inferred]: the YUV->RGB scale (module
+parameters csc_shift / csc_scale2p retune it), the V0 stride unit (bytes assumed) and
+the ZME 6-tap vertical luma packing.  A debugfs "histb_vdp_regs" file dumps the
+registers; allow_poke=1 adds a write file.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain).
+Needs 0001..0010, and 0012 for the clocks named in the device tree.
+

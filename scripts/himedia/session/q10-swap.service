@@ -1,0 +1,11 @@
+[Unit]
+Description=Q10: zram + disk swap (paused Android lives here)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/q10-session/q10-swap
+
+[Install]
+WantedBy=multi-user.target

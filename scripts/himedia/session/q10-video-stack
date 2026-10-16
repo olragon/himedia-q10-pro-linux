@@ -1,0 +1,13 @@
+#!/bin/sh
+# Load the Q10 video/GPU modules in the only working order (decoder before VDP), each under the SP805
+# guard, skipping what is already loaded. histb_vdp evicts simpledrm, so /dev/fb0 changes identity:
+# anything that opens the framebuffer must wait for this to finish. Exit 1 if any module failed,
+# but always tries all of them.
+GUARD=${Q10_MODPROBE_GUARD:-/usr/local/sbin/q10-modprobe-guarded}
+rc=0
+for m in histb_vpss histb_vdec panfrost histb_vdp; do
+  if lsmod | awk '{print $1}' | grep -qx "$m"; then echo "q10-video-stack: $m already loaded"; continue; fi
+  echo "q10-video-stack: loading $m"
+  "$GUARD" "$m" 60 || { echo "q10-video-stack: $m FAILED"; rc=1; }
+done
+exit $rc

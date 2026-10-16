@@ -1,0 +1,632 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: hi3798cv200 - HDMI pixel clock (HPLL) and the HDMI transmitter gates
+
+The Hi3798CV200 HDMI pixel clock is the HPLL (CRG 0x28/0x2c), the VO_HD divider (CRG 0xd8
+bits 19:18) and a pixel gate (CRG 0x278 bit 2).  Mainline has none of it, so no driver could
+change the display mode.  This adds, ported from the community histb-linux 6.12.y tree
+(crg-hi3798cv200.c, hi3798cv200_hdmi_pixel_*):
+
+  clk_hdmi_pixel   a clk_hw with 26 PLL presets that are word for word rows of the vendor 4.4.35
+                   kernel's display format table (decoded by scripts/himedia/display/stock-fmt-table.py),
+                   a solver for any other rate, and a rollback to the previous PLL words when the
+                   new plan does not lock
+  clk_hdmi_*       eight simple gates: CRG 0x10c bits 0..5 (bus, cec, id, mhl, os, as) and
+                   CRG 0x278 bits 0/1 (x, pixel_nx)
+
+Public ids 110..118 (the community tree numbers them 78..86, which collide with this tree's
+inner-clock window 64..89).  hisi_clk_lock is made global so the pixel clock's read-modify-writes
+of CRG 0xd8 / 0x278 are serialised with the gates that share those words.
+
+Differences from the community code - the bootloader's HDMI link is running when this registers
+and must not be disturbed until a consumer asks for a rate:
+
+  * .prepare does nothing.  The community .prepare re-programs the PLL whenever its words differ
+    from the preset for the current rate; the boot words (14e6ae6a/00001062, 148.352 MHz) are an
+    equivalent plan that is NOT a preset row, so registering the clock as critical or the first
+    clk_prepare() would have rewritten the PLL at boot.
+  * CLK_IGNORE_UNUSED on the pixel clock and on all eight gates, so clk_disable_unused() leaves a
+    link nobody has claimed yet alone.  No register is written at registration.
+  * clk_set_rate() writes the two HPLL words and the VO_HD divider field only; the source-select
+    bits (VO_HD_CLK_SEL, HDMI_CLK_SEL, ...) are checked and a mismatch is logged, never written.
+  * the lock wait starts 100 us after the write (the lock bit still shows the OLD lock for a
+    moment) and gives the PLL 10 ms.  On timeout every register is restored and the old PLL is
+    given time to relock; the error goes back to the caller.
+  * one dev_info at registration prints HPLL, lock and CRG54/67/158/211 as the bootloader left
+    them: `dmesg | grep "HDMI pixel clock"`.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain), W=1.
+Needs 0001..0012.
+
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -110,6 +110,22 @@
+  */
+ #define HISTB_CPU_CLK			97
+ 
++/*
++ * HDMI transmitter gates (CRG 0x10c bits 0..5, CRG 0x278 bits 0/1) and the HDMI pixel clock
++ * (HPLL + dividers + gate CRG 0x278 bit 2; drivers/clk/hisilicon/clk-hi3798cv200-hdmi.c).
++ * The community 6.12 tree numbers these 78..86, which collide with our inner-clock window;
++ * they take free public ids 110..118 here.
++ */
++#define HISTB_HDMI_BUS_CLK		110
++#define HISTB_HDMI_CEC_CLK		111
++#define HISTB_HDMI_ID_CLK		112
++#define HISTB_HDMI_MHL_CLK		113
++#define HISTB_HDMI_OS_CLK		114
++#define HISTB_HDMI_AS_CLK		115
++#define HISTB_HDMI_X_CLK		116
++#define HISTB_HDMI_PIXEL_NX_CLK		117
++#define HISTB_HDMI_PIXEL_CLK		118
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2
+--- a/drivers/clk/hisilicon/clk.c
++++ b/drivers/clk/hisilicon/clk.c
+@@ -21,7 +21,8 @@
+ 
+ #include "clk.h"
+ 
+-static DEFINE_SPINLOCK(hisi_clk_lock);
++/* shared with clk-hi3798cv200-hdmi.c: one lock for every read-modify-write of a CRG word */
++DEFINE_SPINLOCK(hisi_clk_lock);
+ 
+ struct hisi_clock_data *hisi_clk_alloc(struct platform_device *pdev,
+ 						int nr_clks)
+--- a/drivers/clk/hisilicon/clk.h
++++ b/drivers/clk/hisilicon/clk.h
+@@ -18,6 +18,8 @@
+ 
+ struct platform_device;
+ 
++extern spinlock_t hisi_clk_lock;
++
+ struct hisi_clock_data {
+ 	struct clk_onecell_data	clk_data;
+ 	void __iomem		*base;
+--- a/drivers/clk/hisilicon/Makefile
++++ b/drivers/clk/hisilicon/Makefile
+@@ -13,7 +13,7 @@
+ obj-$(CONFIG_COMMON_CLK_HI3559A)	+= clk-hi3559a.o
+ obj-$(CONFIG_COMMON_CLK_HI3660) += clk-hi3660.o
+ obj-$(CONFIG_COMMON_CLK_HI3670) += clk-hi3670.o
+-obj-$(CONFIG_COMMON_CLK_HI3798CV200)	+= crg-hi3798cv200.o
++obj-$(CONFIG_COMMON_CLK_HI3798CV200)	+= crg-hi3798cv200.o clk-hi3798cv200-hdmi.o
+ obj-$(CONFIG_COMMON_CLK_HI6220)	+= clk-hi6220.o
+ obj-$(CONFIG_RESET_HISI)	+= reset.o
+ obj-$(CONFIG_STUB_CLK_HI6220)	+= clk-hi6220-stub.o
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -20,6 +20,7 @@
+ #include "clk.h"
+ #include "crg.h"
+ #include "reset.h"
++#include "clk-hi3798cv200-hdmi.h"
+ 
+ /* hi3798CV200 core CRG */
+ #define HI3798CV200_INNER_CLK_OFFSET		64
+@@ -276,6 +277,20 @@
+ 	{ HISTB_VDP_G0_CLK, "clk_vdp_g0", NULL, CLK_IS_CRITICAL, 0x34c, 11, 0 },
+ 	{ HISTB_VDP_V0_CLK, "clk_vdp_v0", NULL, 0, 0x34c, 13, 0 },
+ 	{ HISTB_VO_BP_CLK, "clk_vo_bp", NULL, CLK_IS_CRITICAL, 0x34c, 0, 0 },
++	/*
++	 * HDMI transmitter (histb-hdmi).  CLK_IGNORE_UNUSED: the bootloader's link runs through
++	 * these gates before any driver claims them, and clk_disable_unused() must not close
++	 * them (registering them changes no register).  Unlike the display gates above they are
++	 * not CRITICAL, so a consumer that really disables one is obeyed.
++	 */
++	{ HISTB_HDMI_BUS_CLK, "clk_hdmi_bus", NULL, CLK_IGNORE_UNUSED, 0x10c, 0, 0 },
++	{ HISTB_HDMI_CEC_CLK, "clk_hdmi_cec", NULL, CLK_IGNORE_UNUSED, 0x10c, 1, 0 },
++	{ HISTB_HDMI_ID_CLK, "clk_hdmi_id", NULL, CLK_IGNORE_UNUSED, 0x10c, 2, 0 },
++	{ HISTB_HDMI_MHL_CLK, "clk_hdmi_mhl", NULL, CLK_IGNORE_UNUSED, 0x10c, 3, 0 },
++	{ HISTB_HDMI_OS_CLK, "clk_hdmi_os", NULL, CLK_IGNORE_UNUSED, 0x10c, 4, 0 },
++	{ HISTB_HDMI_AS_CLK, "clk_hdmi_as", NULL, CLK_IGNORE_UNUSED, 0x10c, 5, 0 },
++	{ HISTB_HDMI_X_CLK, "clk_hdmi_x", NULL, CLK_IGNORE_UNUSED, 0x278, 0, 0 },
++	{ HISTB_HDMI_PIXEL_NX_CLK, "clk_hdmi_pixel_nx", NULL, CLK_IGNORE_UNUSED, 0x278, 1, 0 },
+ };
+ 
+ /*
+@@ -918,6 +933,10 @@
+ 	if (ret)
+ 		goto unregister_gate;
+ 
++	ret = hi3798cv200_hdmi_pixel_clk_register(pdev, clk_data);
++	if (ret)
++		goto unregister_gate;
++
+ 	ret = of_clk_add_provider(pdev->dev.of_node,
+ 			of_clk_src_onecell_get, &clk_data->clk_data);
+ 	if (ret)
+--- /dev/null
++++ b/drivers/clk/hisilicon/clk-hi3798cv200-hdmi.c
+@@ -0,0 +1,475 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Hi3798CV200 HDMI pixel clock: the HPLL, its output dividers and the pixel gate
++ * that feeds the HDMI transmitter.
++ *
++ * Ported from the community histb-linux 6.12.y tree, drivers/clk/hisilicon/
++ * crg-hi3798cv200.c (hi3798cv200_hdmi_pixel_*), whose 26 PLL presets are word for
++ * word rows of the vendor 4.4.35 kernel's display format table.
++ *
++ * Differences from the community code, all for ONE reason: the bootloader leaves a
++ * working HDMI link and this clock must never disturb it until a consumer asks for a
++ * rate.
++ *
++ *  - .prepare does nothing.  The community .prepare re-programs the PLL when its words
++ *    differ from the preset for the CURRENT rate - and the boot words (14e6ae6a/00001062)
++ *    are an equivalent 148.352 MHz plan that is not a preset row, so merely registering
++ *    this clock with CLK_IS_CRITICAL, or the first clk_prepare(), would have rewritten
++ *    the PLL at boot.  Here only clk_set_rate() writes the PLL.
++ *  - CLK_IGNORE_UNUSED: clk_disable_unused() must not close the pixel gate (CRG 0x278
++ *    bit 2) of a link nobody has claimed yet.
++ *  - clk_set_rate() writes the two HPLL words and the VO_HD divider field - nothing
++ *    else.  The community code also rewrites the source-select bits (VO_HD_CLK_SEL,
++ *    HDMI_CLK_SEL, ...), which the bootloader's working link has already set; they are
++ *    only CHECKED here and a mismatch is logged.
++ *  - on a failed lock every register is put back and the old PLL is given time to
++ *    relock; the error is returned to the caller.
++ *
++ * Not tested on hardware.
++ */
++#include <linux/bitfield.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/math64.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#include <dt-bindings/clock/histb-clock.h>
++
++#include "clk.h"
++#include "clk-hi3798cv200-hdmi.h"
++
++#define HPLL_CTRL0		0x28
++#define  HPLL_FRAC_MASK		GENMASK(23, 0)
++#define  HPLL_POSTDIV1_MASK	GENMASK(26, 24)
++#define  HPLL_POSTDIV2_MASK	GENMASK(30, 28)
++#define HPLL_CTRL1		0x2c
++#define  HPLL_FBDIV_MASK	GENMASK(11, 0)
++#define  HPLL_REFDIV_MASK	GENMASK(17, 12)
++#define  HPLL_POWER_MASK	GENMASK(24, 20)
++#define  HPLL_DSMPD		BIT(25)
++#define  HPLL_BYPASS		BIT(26)
++#define HPLL_LOCK_STATUS	0x150
++#define  HPLL_LOCK		BIT(4)
++
++#define VO_CLK_CTRL		0xd8		/* PERI_CRG54 */
++#define  VO_HD_CLK_SEL		BIT(16)
++#define  VO_HD_CLK_DIV_MASK	GENMASK(19, 18)
++#define  VO_HD_CLK_DIV_2	0
++#define  VO_HD_CLK_DIV_4	1
++#define  VO_HD_CLK_DIV_1	3
++#define  HDMI_CLK_SEL		BIT(25)
++#define  VDP_CLK_SEL		BIT(27)
++#define  VO_HD_HDMI_DIV		BIT(29)
++#define HDMI_CTRL_CLK		0x10c		/* PERI_CRG67 */
++#define  HDMI_ASCLK_SEL		BIT(14)
++#define HDMI_PIXEL_CTRL		0x278		/* PERI_CRG158 */
++#define  HDMI_PIXEL_GATE	BIT(2)
++#define  HDMI_PIXELNX_SEL	BIT(4)
++#define  HDMI_OSCLK_SEL		BIT(5)
++#define  HDMI_IDCLK_SEL		BIT(6)
++#define VDP_CLK_CTRL		0x34c
++#define  VDP_HD_DIV0		BIT(20)
++#define  VDP_INIT_SEL0		BIT(22)
++#define  VO_HD_BP_CLK_SEL	BIT(23)
++
++#define PIXEL_MIN_RATE		25000000UL
++#define HDMI14_MAX_RATE		340000000UL
++#define PIXEL_MAX_RATE		594000000UL
++#define HPLL_PARENT_RATE	24000000UL
++#define HPLL_VCO_MIN_RATE	800000000ULL
++#define HPLL_VCO_MAX_RATE	2400000000ULL
++
++/* the old PLL needs this long to drop and re-acquire lock; 10 us was never enough to trust a stale bit */
++#define HPLL_SETTLE_US		100
++#define HPLL_LOCK_TIMEOUT_US	10000
++
++struct hi3798cv200_hdmi_pixel_clk {
++	struct clk_hw hw;
++	void __iomem *base;
++	struct mutex lock;
++};
++
++struct pixel_rate {
++	unsigned long request_rate;
++	unsigned long rate;
++	u32 frac;
++	u16 fbdiv;
++	u8 refdiv;
++	u8 postdiv1;
++	u8 postdiv2;
++	bool dsmpd;
++};
++
++/*
++ * Vendor clock plans (kernel 4.4.35 DISP_FMT table, decoded from the stock image by
++ * scripts/himedia/display/stock-fmt-table.py).  VESA nominal clocks do not always equal
++ * the PLL's real output, so both are kept: request_rate is what the mode says, rate what
++ * the PLL makes.  "Keep the production divider placement and the fractional-mode setting:
++ * equivalent arithmetic solutions have not proved equivalent on this hardware."
++ */
++static const struct pixel_rate presets[] = {
++	/* request, actual, frac, fbdiv, refdiv, postdiv1, postdiv2, dsmpd      HPLL ctrl0/ctrl1 */
++	{  25175000,  25200000,        0,  168,  5, 4, 2, false }, /* 24000000/000050a8 */
++	{  40000000,  39792000,        0, 1658, 25, 5, 2, false }, /* 25000000/0001967a */
++	{  65000000,  64992000,        0, 1354, 25, 5, 1, false }, /* 15000000/0001954a */
++	{  74176000,  74175750, 0xe6a7ef,   98,  2, 4, 1, false }, /* 14e6a7ef/00002062 */
++	{  74250000,  74250000,        0,   99,  2, 4, 1, false }, /* 14000000/00002063 */
++	{  83500000,  83760000,        0, 1047, 25, 3, 1, false }, /* 13000000/00019417 */
++	{  85500000,  85480000,        0, 2137, 50, 3, 1, false }, /* 13000000/00032859 */
++	{  85800000,  85800000,        0,  429, 10, 3, 1, false }, /* 13000000/0000a1ad */
++	{  88750000,  88750000,        0,  355,  6, 4, 1, false }, /* 14000000/00006163 */
++	{  97750000,  97750000,        0,  391,  6, 4, 1, false }, /* 14000000/00006187 */
++	{ 106500000, 106700000,        0, 1067, 30, 2, 1, false }, /* 12000000/0001e42b */
++	{ 108000000, 107952000,        0, 2249, 25, 5, 1, false }, /* 15000000/000198c9 */
++	{ 121750000, 121800000,        0,  203,  5, 2, 1, false }, /* 12000000/000050cb */
++	{ 146250000, 146375000,        0, 1171, 24, 2, 1, false }, /* 12000000/00018493 */
++	{ 148352000, 148351500, 0xe6a7ef,   98,  2, 2, 1, false }, /* 12e6a7ef/00002062 */
++	{ 148500000, 148500000,        0,   99,  2, 2, 1, false }, /* 12000000/00002063 */
++	{ 154000000, 154000000,        0,  154,  3, 2, 1, false }, /* 12000000/0000309a */
++	{ 156750000, 157000000,        0,  157,  3, 2, 1, false }, /* 12000000/0000309d */
++	{ 162000000, 162000000,        0,   54,  1, 2, 1, false }, /* 12000000/00001036 */
++	{ 234000000, 234000000,        0,   39,  1, 1, 1, false }, /* 11000000/00001027 */
++	{ 241500000, 241500000,        0,  161,  2, 2, 1, false }, /* 12000000/000020a1 */
++	{ 268500000, 268500000,        0,  179,  2, 2, 1, false }, /* 12000000/000020b3 */
++	{ 296703000, 296703000, 0xe6a7ef,   98,  2, 1, 1, false }, /* 11e6a7ef/00002062 */
++	{ 297000000, 297000000,        0,   99,  2, 1, 1, false }, /* 11000000/00002063 */
++	{ 593407000, 593406000, 0xe6a7ef,   98,  2, 1, 1, false }, /* 11e6a7ef/00002062 */
++	{ 594000000, 594000000,        0,   99,  2, 1, 1, false }, /* 11000000/00002063 */
++};
++
++/* divider products and factor preference used by the vendor's custom mode */
++static const u8 postdiv_products[] = {
++	1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16, 18, 20, 21, 24,
++	25, 28, 30, 35, 36, 42, 49,
++};
++
++#define to_pixel(_hw) container_of(_hw, struct hi3798cv200_hdmi_pixel_clk, hw)
++
++static bool pixel_find_rate(unsigned long rate, unsigned long parent_rate,
++			    struct pixel_rate *best)
++{
++	u64 best_delta = U64_MAX;
++	u8 output_divider;
++	unsigned int i;
++
++	if (!parent_rate || rate < PIXEL_MIN_RATE || rate > PIXEL_MAX_RATE)
++		return false;
++
++	if (parent_rate == HPLL_PARENT_RATE) {
++		for (i = 0; i < ARRAY_SIZE(presets); i++) {
++			if (rate != presets[i].request_rate &&
++			    rate != presets[i].rate)
++				continue;
++
++			*best = presets[i];
++			return true;
++		}
++	}
++
++	/*
++	 * The display channel contributes another fixed divide-by-two.  The vendor
++	 * clock plan uses VO /2 up to HDMI 1.4 rates and VO /1 for HDMI 2.0 rates:
++	 * total output divisors of four and two.
++	 */
++	output_divider = rate > HDMI14_MAX_RATE ? 2 : 4;
++
++	for (i = 0; i < ARRAY_SIZE(postdiv_products); i++) {
++		u8 product = postdiv_products[i];
++		u8 postdiv1, postdiv2, refdiv;
++		u64 target_vco;
++
++		/* the vendor stores the first factor in the high divider field */
++		for (postdiv2 = 1; postdiv2 <= 7; postdiv2++) {
++			if (!(product % postdiv2) && product / postdiv2 <= 7)
++				break;
++		}
++		if (postdiv2 > 7)
++			continue;
++		postdiv1 = product / postdiv2;
++		target_vco = (u64)rate * output_divider * product;
++
++		if (target_vco <= HPLL_VCO_MIN_RATE || target_vco >= HPLL_VCO_MAX_RATE)
++			continue;
++
++		for (refdiv = 1; refdiv <= 63; refdiv++) {
++			u64 scaled, actual, delta, denominator;
++			u32 frac;
++			u16 fbdiv;
++
++			scaled = DIV_ROUND_CLOSEST_ULL((target_vco * refdiv) << 24,
++						       parent_rate);
++			fbdiv = scaled >> 24;
++			frac = scaled & HPLL_FRAC_MASK;
++			if (fbdiv <= 16 || fbdiv >= 2400)
++				continue;
++
++			denominator = (u64)refdiv * product * output_divider << 24;
++			actual = DIV64_U64_ROUND_CLOSEST((u64)parent_rate * scaled,
++							 denominator);
++			delta = actual > rate ? actual - rate : rate - actual;
++
++			if (delta > best_delta ||
++			    (delta == best_delta && (frac || !best->frac)))
++				continue;
++
++			best_delta = delta;
++			best->request_rate = rate;
++			best->rate = actual;
++			best->frac = frac;
++			best->fbdiv = fbdiv;
++			best->refdiv = refdiv;
++			best->postdiv1 = postdiv1;
++			best->postdiv2 = postdiv2;
++			best->dsmpd = !frac;
++		}
++	}
++
++	return best_delta != U64_MAX;
++}
++
++static int pixel_clk_enable(struct clk_hw *hw)
++{
++	struct hi3798cv200_hdmi_pixel_clk *pixel = to_pixel(hw);
++	unsigned long flags;
++	u32 reg;
++
++	spin_lock_irqsave(&hisi_clk_lock, flags);
++	reg = readl_relaxed(pixel->base + HDMI_PIXEL_CTRL);
++	writel_relaxed(reg | HDMI_PIXEL_GATE, pixel->base + HDMI_PIXEL_CTRL);
++	spin_unlock_irqrestore(&hisi_clk_lock, flags);
++
++	return 0;
++}
++
++static void pixel_clk_disable(struct clk_hw *hw)
++{
++	struct hi3798cv200_hdmi_pixel_clk *pixel = to_pixel(hw);
++	unsigned long flags;
++	u32 reg;
++
++	spin_lock_irqsave(&hisi_clk_lock, flags);
++	reg = readl_relaxed(pixel->base + HDMI_PIXEL_CTRL);
++	writel_relaxed(reg & ~HDMI_PIXEL_GATE, pixel->base + HDMI_PIXEL_CTRL);
++	spin_unlock_irqrestore(&hisi_clk_lock, flags);
++}
++
++static int pixel_clk_is_enabled(struct clk_hw *hw)
++{
++	struct hi3798cv200_hdmi_pixel_clk *pixel = to_pixel(hw);
++
++	return !!(readl_relaxed(pixel->base + HDMI_PIXEL_CTRL) & HDMI_PIXEL_GATE);
++}
++
++static unsigned long pixel_clk_recalc_rate(struct clk_hw *hw,
++					   unsigned long parent_rate)
++{
++	struct hi3798cv200_hdmi_pixel_clk *pixel = to_pixel(hw);
++	u32 ctrl0, ctrl1, frac, vo;
++	u32 postdiv1, postdiv2, fbdiv, refdiv, output_divider;
++	u64 scaled, denominator;
++
++	if (!(readl_relaxed(pixel->base + HPLL_LOCK_STATUS) & HPLL_LOCK))
++		return 0;
++
++	ctrl0 = readl_relaxed(pixel->base + HPLL_CTRL0);
++	ctrl1 = readl_relaxed(pixel->base + HPLL_CTRL1);
++	if (ctrl1 & (HPLL_POWER_MASK | HPLL_BYPASS))
++		return 0;
++
++	postdiv1 = FIELD_GET(HPLL_POSTDIV1_MASK, ctrl0);
++	postdiv2 = FIELD_GET(HPLL_POSTDIV2_MASK, ctrl0);
++	fbdiv = FIELD_GET(HPLL_FBDIV_MASK, ctrl1);
++	refdiv = FIELD_GET(HPLL_REFDIV_MASK, ctrl1);
++	if (!postdiv1 || !postdiv2 || !fbdiv || !refdiv)
++		return 0;
++
++	vo = readl_relaxed(pixel->base + VO_CLK_CTRL);
++	switch (FIELD_GET(VO_HD_CLK_DIV_MASK, vo)) {
++	case 2:
++	case VO_HD_CLK_DIV_1:
++		output_divider = 2;
++		break;
++	case VO_HD_CLK_DIV_2:
++		output_divider = 4;
++		break;
++	case VO_HD_CLK_DIV_4:
++		output_divider = 8;
++		break;
++	default:
++		return 0;
++	}
++
++	frac = ctrl1 & HPLL_DSMPD ? 0 : FIELD_GET(HPLL_FRAC_MASK, ctrl0);
++	scaled = ((u64)fbdiv << 24) | frac;
++	denominator = (u64)refdiv * postdiv1 * postdiv2 * output_divider << 24;
++
++	return DIV64_U64_ROUND_CLOSEST((u64)parent_rate * scaled, denominator);
++}
++
++static long pixel_clk_round_rate(struct clk_hw *hw, unsigned long rate,
++				 unsigned long *parent_rate)
++{
++	struct pixel_rate pr = {};
++
++	if (!pixel_find_rate(rate, *parent_rate, &pr))
++		return -EINVAL;
++
++	return pr.rate;
++}
++
++/* the source selects the bootloader's working link already has; a mismatch is only worth a line */
++static void pixel_check_selects(struct hi3798cv200_hdmi_pixel_clk *pixel)
++{
++	u32 vo = readl_relaxed(pixel->base + VO_CLK_CTRL);
++	u32 vdp = readl_relaxed(pixel->base + VDP_CLK_CTRL);
++	u32 hdmi = readl_relaxed(pixel->base + HDMI_CTRL_CLK);
++	u32 pix = readl_relaxed(pixel->base + HDMI_PIXEL_CTRL);
++
++	if ((vo & (VO_HD_CLK_SEL | HDMI_CLK_SEL)) != (VO_HD_CLK_SEL | HDMI_CLK_SEL) ||
++	    (vo & (VDP_CLK_SEL | VO_HD_HDMI_DIV)) ||
++	    !(vdp & VDP_HD_DIV0) || (vdp & (VDP_INIT_SEL0 | VO_HD_BP_CLK_SEL)) ||
++	    (hdmi & HDMI_ASCLK_SEL) || !(pix & HDMI_OSCLK_SEL) ||
++	    (pix & (HDMI_PIXELNX_SEL | HDMI_IDCLK_SEL)))
++		pr_warn_once("hi3798cv200-crg: HDMI clock selects differ from the community plan (CRG54 %08x CRG67 %08x CRG158 %08x CRG211 %08x); only the HPLL words and the VO_HD divider are written\n",
++			     vo, hdmi, pix, vdp);
++}
++
++static int pixel_clk_set_rate(struct clk_hw *hw, unsigned long rate,
++			      unsigned long parent_rate)
++{
++	struct hi3798cv200_hdmi_pixel_clk *pixel = to_pixel(hw);
++	struct pixel_rate pr = {};
++	u32 old_ctrl0, old_ctrl1, old_vo, old_pix, ctrl0, ctrl1, vo, status;
++	bool old_locked;
++	unsigned long flags;
++	int ret, rollback = 0;
++
++	if (!pixel_find_rate(rate, parent_rate, &pr))
++		return -EINVAL;
++
++	mutex_lock(&pixel->lock);
++	pixel_check_selects(pixel);
++
++	spin_lock_irqsave(&hisi_clk_lock, flags);
++	old_ctrl0 = readl_relaxed(pixel->base + HPLL_CTRL0);
++	old_ctrl1 = readl_relaxed(pixel->base + HPLL_CTRL1);
++	old_vo = readl_relaxed(pixel->base + VO_CLK_CTRL);
++	old_pix = readl_relaxed(pixel->base + HDMI_PIXEL_CTRL);
++	old_locked = !!(readl_relaxed(pixel->base + HPLL_LOCK_STATUS) & HPLL_LOCK);
++
++	/* stop the pixel output while the PLL and its divider change */
++	writel_relaxed(old_pix & ~HDMI_PIXEL_GATE, pixel->base + HDMI_PIXEL_CTRL);
++	readl_relaxed(pixel->base + HDMI_PIXEL_CTRL);
++
++	ctrl0 = (old_ctrl0 & ~(HPLL_FRAC_MASK | HPLL_POSTDIV1_MASK | HPLL_POSTDIV2_MASK)) |
++		FIELD_PREP(HPLL_FRAC_MASK, pr.frac) |
++		FIELD_PREP(HPLL_POSTDIV1_MASK, pr.postdiv1) |
++		FIELD_PREP(HPLL_POSTDIV2_MASK, pr.postdiv2);
++	ctrl1 = (old_ctrl1 & ~(HPLL_FBDIV_MASK | HPLL_REFDIV_MASK | HPLL_POWER_MASK |
++			       HPLL_DSMPD | HPLL_BYPASS)) |
++		FIELD_PREP(HPLL_FBDIV_MASK, pr.fbdiv) |
++		FIELD_PREP(HPLL_REFDIV_MASK, pr.refdiv) |
++		(pr.dsmpd ? HPLL_DSMPD : 0);
++	vo = (old_vo & ~VO_HD_CLK_DIV_MASK) |
++	     FIELD_PREP(VO_HD_CLK_DIV_MASK,
++			rate > HDMI14_MAX_RATE ? VO_HD_CLK_DIV_1 : VO_HD_CLK_DIV_2);
++
++	writel_relaxed(ctrl0, pixel->base + HPLL_CTRL0);
++	writel_relaxed(ctrl1, pixel->base + HPLL_CTRL1);
++	writel_relaxed(vo, pixel->base + VO_CLK_CTRL);
++	readl_relaxed(pixel->base + VO_CLK_CTRL);
++	spin_unlock_irqrestore(&hisi_clk_lock, flags);
++
++	/* the lock bit still shows the OLD lock for a moment; do not take it for the new one */
++	usleep_range(HPLL_SETTLE_US, 2 * HPLL_SETTLE_US);
++	ret = readl_poll_timeout(pixel->base + HPLL_LOCK_STATUS, status,
++				 status & HPLL_LOCK, 10, HPLL_LOCK_TIMEOUT_US);
++	if (ret) {
++		spin_lock_irqsave(&hisi_clk_lock, flags);
++		writel_relaxed(old_ctrl0, pixel->base + HPLL_CTRL0);
++		writel_relaxed(old_ctrl1, pixel->base + HPLL_CTRL1);
++		writel_relaxed(old_vo, pixel->base + VO_CLK_CTRL);
++		writel_relaxed(old_pix, pixel->base + HDMI_PIXEL_CTRL);
++		spin_unlock_irqrestore(&hisi_clk_lock, flags);
++
++		if (old_locked) {
++			usleep_range(HPLL_SETTLE_US, 2 * HPLL_SETTLE_US);
++			rollback = readl_poll_timeout(pixel->base + HPLL_LOCK_STATUS,
++						      status, status & HPLL_LOCK,
++						      10, HPLL_LOCK_TIMEOUT_US);
++		}
++		pr_err("hi3798cv200-crg: HPLL did not lock for %lu Hz (ctrl0 %08x ctrl1 %08x); %s (ctrl0 %08x ctrl1 %08x)\n",
++		       rate, ctrl0, ctrl1,
++		       rollback ? "ROLLBACK DID NOT RELOCK either" : "old plan restored",
++		       old_ctrl0, old_ctrl1);
++		ret = -ETIMEDOUT;
++	} else if (old_pix & HDMI_PIXEL_GATE) {
++		/* a running stream gets its clock back only after the new PLL locked */
++		spin_lock_irqsave(&hisi_clk_lock, flags);
++		writel_relaxed(readl_relaxed(pixel->base + HDMI_PIXEL_CTRL) | HDMI_PIXEL_GATE,
++			       pixel->base + HDMI_PIXEL_CTRL);
++		spin_unlock_irqrestore(&hisi_clk_lock, flags);
++	}
++	mutex_unlock(&pixel->lock);
++
++	return ret;
++}
++
++static const struct clk_ops pixel_clk_ops = {
++	.enable = pixel_clk_enable,
++	.disable = pixel_clk_disable,
++	.is_enabled = pixel_clk_is_enabled,
++	.recalc_rate = pixel_clk_recalc_rate,
++	.round_rate = pixel_clk_round_rate,
++	.set_rate = pixel_clk_set_rate,
++};
++
++int hi3798cv200_hdmi_pixel_clk_register(struct platform_device *pdev,
++					struct hisi_clock_data *clk_data)
++{
++	static const char *const parent_names[] = { "clk_osc" };
++	struct hi3798cv200_hdmi_pixel_clk *pixel;
++	struct clk_init_data init = {
++		.name = "clk_hdmi_pixel",
++		.ops = &pixel_clk_ops,
++		.parent_names = parent_names,
++		.num_parents = ARRAY_SIZE(parent_names),
++		/* GET_RATE_NOCACHE: the PLL words change under the framework; IGNORE_UNUSED: see top */
++		.flags = CLK_GET_RATE_NOCACHE | CLK_IGNORE_UNUSED,
++	};
++	struct clk *clk;
++
++	pixel = devm_kzalloc(&pdev->dev, sizeof(*pixel), GFP_KERNEL);
++	if (!pixel)
++		return -ENOMEM;
++
++	pixel->base = clk_data->base;
++	pixel->hw.init = &init;
++	mutex_init(&pixel->lock);
++
++	clk = clk_register(&pdev->dev, &pixel->hw);
++	if (IS_ERR(clk))
++		return PTR_ERR(clk);
++
++	clk_data->clk_data.clks[HISTB_HDMI_PIXEL_CLK] = clk;
++
++	/* one read-only line so a test run shows what the bootloader left, before anything runs */
++	dev_info(&pdev->dev,
++		 "HDMI pixel clock: HPLL %08x/%08x lock %08x, CRG54 %08x CRG67 %08x CRG158 %08x CRG211 %08x\n",
++		 readl_relaxed(pixel->base + HPLL_CTRL0), readl_relaxed(pixel->base + HPLL_CTRL1),
++		 readl_relaxed(pixel->base + HPLL_LOCK_STATUS),
++		 readl_relaxed(pixel->base + VO_CLK_CTRL), readl_relaxed(pixel->base + HDMI_CTRL_CLK),
++		 readl_relaxed(pixel->base + HDMI_PIXEL_CTRL), readl_relaxed(pixel->base + VDP_CLK_CTRL));
++
++	return 0;
++}
++
++void hi3798cv200_hdmi_pixel_clk_unregister(struct hisi_clock_data *clk_data)
++{
++	clk_unregister(clk_data->clk_data.clks[HISTB_HDMI_PIXEL_CLK]);
++	clk_data->clk_data.clks[HISTB_HDMI_PIXEL_CLK] = NULL;
++}
+--- /dev/null
++++ b/drivers/clk/hisilicon/clk-hi3798cv200-hdmi.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __HI3798CV200_HDMI_CLK_H
++#define __HI3798CV200_HDMI_CLK_H
++
++struct platform_device;
++struct hisi_clock_data;
++
++int hi3798cv200_hdmi_pixel_clk_register(struct platform_device *pdev,
++					struct hisi_clock_data *clk_data);
++void hi3798cv200_hdmi_pixel_clk_unregister(struct hisi_clock_data *clk_data);
++
++#endif

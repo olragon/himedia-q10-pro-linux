@@ -1,0 +1,22 @@
+LOCAL PATCH (not submitted anywhere): phy: hisilicon: histb-combphy — allow 32-bit ARM
+
+PHY_HISTB_COMBPHY is gated on ARM64, but the driver is architecture-neutral:
+it touches a syscon regmap, a clock and a reset, and contains no 64-bit
+assumptions. The SoCs it serves are Cortex-A53, which also run AArch32, and
+the stock bootloader on at least one retail Hi3798CV200 box is a 32-bit U-Boot
+whose bootm rejects an arm64 image - so a 32-bit kernel is the only way to
+boot mainline there without replacing the bootloader.
+
+Dropping the ARM64 condition lets ARCH_HISI on ARCH_MULTI_V7 select it. The
+COMPILE_TEST alternative is retained.
+
+--- a/drivers/phy/hisilicon/Kconfig
++++ b/drivers/phy/hisilicon/Kconfig
+@@
+ config PHY_HISTB_COMBPHY
+ 	tristate "HiSilicon STB SoCs COMBPHY support"
+-	depends on (ARCH_HISI && ARM64) || COMPILE_TEST
++	depends on ARCH_HISI || COMPILE_TEST
+ 	select GENERIC_PHY
+ 	select MFD_SYSCON
+ 	help

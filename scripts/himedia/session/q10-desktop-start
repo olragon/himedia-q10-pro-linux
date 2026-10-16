@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start the Q10 X desktop on the first free display (cage may hold :0 for Xwayland while Android
+# is paused). Same arguments q10-desktop.service used with a fixed :0.
+n=0; while [ -e /tmp/.X$n-lock ] && kill -0 "$(tr -dc 0-9 < /tmp/.X$n-lock)" 2>/dev/null; do n=$((n+1)); done
+echo "q10-desktop: X on :$n" > /dev/kmsg
+exec /usr/bin/xinit /usr/local/bin/q10-session -- :$n vt7 -nolisten tcp -keeptty

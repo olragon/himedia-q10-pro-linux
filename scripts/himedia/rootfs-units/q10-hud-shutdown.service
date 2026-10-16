@@ -1,0 +1,15 @@
+# Front panel during shutdown: "SAVING" from the moment a poweroff/reboot starts until the final
+# system-shutdown hook writes OFF / REBOOT. Ordered After= the clock so the clock is stopped first
+# (a stop is always ordered before a start) and cannot overwrite the message.
+[Unit]
+Description=Q10: front panel shows SAVING while the box shuts down
+DefaultDependencies=no
+After=q10-hud.service
+Before=shutdown.target umount.target final.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/q10-panel text SAVING 7
+
+[Install]
+WantedBy=poweroff.target halt.target reboot.target

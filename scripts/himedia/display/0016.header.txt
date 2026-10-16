@@ -1,0 +1,51 @@
+LOCAL PATCH (not submitted anywhere): drm/bridge: add the HiSilicon HiSTB (Hi3798CV200) HDMI transmitter
+
+A DRM bridge for the HDMI TX of the Hi3798CV200: a Silicon Image TPI-style core ("imagev200",
+8-bit registers one per 32-bit word in 256-byte pages at 0xf8ce0000) with a HiSilicon PHY.  It is
+NOT a DesignWare core, so dw-hdmi cannot be used.  Ported from the community histb-linux 6.12.y
+driver of the same name (1,944 lines) to 6.18:
+
+  EDID over the TX's own DDC master, hot plug (polled or IRQ), the PHY tables per TMDS rate,
+  SCDC + scrambling above 340 MHz (HDMI 2.0, 2160p50/60), the video path (RGB, 4:4:4, 4:2:2,
+  4:2:0, 8..12 bpc), AVI / SPD / vendor / DRM infoframes through the generic
+  DRM_BRIDGE_OP_HDMI helpers - which also give HDR_OUTPUT_METADATA and Colorspace.
+
+6.18 API changes the community source needed: atomic_{pre_enable,enable,disable,post_disable}
+take a struct drm_atomic_state, .detect takes the connector, bridge.color_format_property is gone.
+
+The design change for the Q10 Pro: it ADOPTS the bootloader's running link.
+
+  * probe() resets nothing, re-initialises nothing and never switches TMDS off (the community
+    probe asserts all three resets and runs the vendor init: the TV goes black at modprobe).
+  * until a commit asks for a mode other than the one the bootloader started - the display driver
+    names it with histb_hdmi_set_boot_mode() - every atomic_* hook returns without touching the
+    hardware, and disabling an adopted link never blanks it.
+  * the first different mode takes the link over with the community's complete sequence
+    (bus/core/phy reset, vendor init, configure); from then on every enable runs it, except a
+    commit that changes nothing the TX is configured by (HDR metadata, colorimetry): then the
+    link stays up and only the infoframes are rewritten.
+  * the pixel clock RATE is set by the CRTC driver before the display is retimed; the bridge only
+    gates it and verifies the rate (0.5 %).  If the CRTC could not set it the bridge gives up and
+    turns the previous output back on.
+  * a changed HDR / colorimetry infoframe forces the (cheap) enable pass, which the generic helper
+    does not.
+  * the bridge is allocated with devm_drm_bridge_alloc(): 6.18 bridges are refcounted and a devm_kzalloc one
+    WARNs in drm_bridge_add (and again in drm_bridge_attach).
+  * HDMI audio configured by another driver (q10_aiao) is saved before the TX reset and restored
+    after TMDS is up, so a mode switch does not silence it.
+  * EDID: if the first read fails the two DDC speed registers (all vendor init adds for DDC) are
+    set and it is retried once.  force_connected=1 (default) reports the connector connected
+    whatever the HPD/RSEN bits say: the box has always had a TV on it, and an unverified decode of
+    those bits must not be able to remove the console.  force_connected=0 trusts the hardware.
+  * debugfs /sys/kernel/debug/histb-hdmi/{state,regs}: read-only dump of the link state and of the
+    register pages 0, 2, 6, 7, 9, a, b, d.
+  * max_output_bpc=8 (module parameter, writable): the highest colour depth a commit may pick.  The
+    display pipe is 8 bit and a compositor that sets "max bpc" 12 must not get deep colour by accident;
+    HDR_OUTPUT_METADATA exists regardless (bridge max_bpc is 12) and is sent at 8 bit.
+  * allow_poke=1 adds /sys/kernel/debug/histb-hdmi/poke ("page reg value", hex) for live experiments.
+
+Exports histb_hdmi_set_boot_mode() (include/drm/bridge/histb_hdmi.h).
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain), W=1.
+Needs 0001..0012 and 0015 (clock ids).
+

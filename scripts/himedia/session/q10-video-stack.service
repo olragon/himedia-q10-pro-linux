@@ -1,0 +1,10 @@
+# Q10: load the blacklisted video/GPU modules once; every session Requires+After this.
+[Unit]
+Description=Q10: video stack (histb_vpss, histb_vdec, panfrost, histb_vdp)
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/q10-session/q10-video-stack
+TimeoutStartSec=300

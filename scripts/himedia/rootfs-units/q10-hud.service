@@ -1,0 +1,13 @@
+# Q10 front panel (TM1629A): local-time clock, HH:MM with a blinking colon.
+# The panel tool bit-bangs GPIO2_0/3/4 through /dev/mem (scripts/himedia/tools/q10-panel.c).
+[Unit]
+Description=Q10: front-panel clock
+After=time-sync.target
+
+[Service]
+ExecStart=/usr/local/sbin/q10-panel clock 2
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

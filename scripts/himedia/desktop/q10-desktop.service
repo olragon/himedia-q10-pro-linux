@@ -1,0 +1,17 @@
+# Q10 desktop (manual start: systemctl start q10-desktop). NOT enabled at boot on purpose — a broken
+# GUI stack must never stand between the box and ssh. Console messages are quieted while it runs.
+[Unit]
+Description=Q10: X desktop on HDMI (simpledrm)
+After=systemd-user-sessions.service
+
+[Service]
+Environment=Q10_APP=
+EnvironmentFile=-/etc/default/q10-desktop
+ExecStartPre=/usr/local/bin/q10-xorg-select
+ExecStartPre=/bin/sh -c 'echo 3 > /proc/sys/kernel/printk'
+ExecStart=/usr/bin/xinit /usr/local/bin/q10-session -- :0 vt7 -nolisten tcp -keeptty
+ExecStopPost=/bin/sh -c 'echo 7 > /proc/sys/kernel/printk'
+Restart=no
+
+[Install]
+WantedBy=graphical.target

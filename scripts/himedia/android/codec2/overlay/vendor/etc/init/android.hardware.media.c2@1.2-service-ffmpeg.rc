@@ -1,0 +1,10 @@
+# DRAFT. From raspberry-vanilla android-13.0 (user media, class hal). Open questions marked.
+service android-hardware-media-c2-ffmpeg-hal-1-2 /vendor/bin/hw/android.hardware.media.c2@1.2-service-ffmpeg
+    class hal
+    user media
+    group mediadrm drmrpc
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh
+    # UNVERIFIED: /dev/media0 + /dev/video0 reach the container only if lxc.py binds them
+    # (host-install.sh patches /dev/media*; /dev/video* is already globbed) and the host node mode
+    # lets uid 1013 (media) open them (host-install.sh installs a udev rule, 0666).

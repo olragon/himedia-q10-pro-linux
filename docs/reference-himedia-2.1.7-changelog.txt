@@ -1,0 +1,13 @@
+HiMedia 2.1.7 firmware,
+Q100: http://www.mediafire.com/file/59n7qkdira0x52e/file
+Q10Pro: http://www.mediafire.com/file/1bqf7zcpejcjw96/file
+Q5Pro: http://www.mediafire.com/file/9121zzg522pgdf1/file
+Q30: http://www.mediafire.com/file/zoy5vg4qukrf4qr/file
+Google patch firmware for Q100/Q30: https://drive.google.com/drive/folders/1DoMPTtm0rbrINtKn0GBqRGqrHsuPUoXQ?usp=sharing
+Google patch firmware for Q10Pro/Q5Pro: https://drive.google.com/drive/folders/1eV6P4jYV2bejDsxoKYJWi3Woq9GsCocC?usp=sharing
+Change log:
+1. Optimized third-party app playback compatibility. (Switch: Settings -->Advance -->Display-->HDCP Switch and settings -->Advance -->
+Display -->Close the system navigation bar)
+2. Optimized the application manager to support loading and starting TV version applications.
+2. Support the function of CEC to switch TV or power amplifier. (Switch: Settings --Advance--Standby--HDMI CEC)
+3. Solved the black screen problem of local playback after enabling hdcp.

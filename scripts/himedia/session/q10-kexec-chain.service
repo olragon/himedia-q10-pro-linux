@@ -1,0 +1,18 @@
+# Stage 1: hand the stick's kernel over to /etc/q10/kernel.conf's target by kexec, before any
+# session or the video stack starts. Skipped in the chained kernel itself (q10.chained=1).
+[Unit]
+Description=Q10: kexec into the configured kernel (stage 1)
+DefaultDependencies=no
+ConditionKernelCommandLine=!q10.chained
+# Not After=q10-sata.service: the initramfs already mounted the SATA root, and waiting for that
+# unit cost ~45 s of k14 boot before the handover (2026-10-12).
+After=local-fs.target
+Before=q10-video-stack.service q10-session-boot.service q10-desktop.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/q10-kexec-chain
+
+[Install]
+WantedBy=sysinit.target

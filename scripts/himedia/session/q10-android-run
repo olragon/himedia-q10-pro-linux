@@ -1,0 +1,23 @@
+#!/bin/sh
+# Runs INSIDE cage (so the waydroid session inherits WAYLAND_DISPLAY): start the audio server,
+# then the Waydroid session, wait for it, show the UI.
+# ⛔ The LXC config bind-mounts $XDG_RUNTIME_DIR/pulse/native; without it the container fails
+# to start ("Failed to mount .../pulse/native", 2026-10-12). PipeWire (installed) provides it.
+LOG=/var/log/q10/android-session.log
+echo "=== $(date -Is) q10-android-run XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY" >> $LOG
+# Splash first: cage otherwise shows black until Android's own window maps (~100 s).
+/usr/local/lib/q10-session/q10-android-splash.py >>$LOG 2>&1 &
+pipewire >>$LOG 2>&1 &
+sleep 1
+wireplumber >>$LOG 2>&1 &
+pipewire-pulse >>$LOG 2>&1 &
+i=0; while [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ] && [ $i -lt 20 ]; do i=$((i+1)); sleep 0.5; done
+[ -S "$XDG_RUNTIME_DIR/pulse/native" ] || echo "no pulse socket after 10 s" >> $LOG
+waydroid session start >>$LOG 2>&1 &
+i=0
+while [ $i -lt 120 ]; do
+  waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING' && break
+  i=$((i+1)); sleep 1
+done
+echo "$(date -Is) session after ${i}s: $(waydroid status 2>&1 | head -1)" >> $LOG
+exec waydroid show-full-ui >>$LOG 2>&1

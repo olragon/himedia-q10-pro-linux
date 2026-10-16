@@ -1,0 +1,12 @@
+# Power key like a TV box: press = standby/wake, hold 3 s = off, press from off = boot (q10power.py).
+[Unit]
+Description=Q10: power key (standby / wake / off / boot)
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/q10-session/q10power.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

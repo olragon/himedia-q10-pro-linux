@@ -1,0 +1,15 @@
+# Q10: choose the session at boot (kernel q10.session=, else the TV menu with a 10 s countdown).
+# Type=simple, not oneshot: a oneshot would hold multi-user.target for the whole countdown.
+# Wants+After the video stack (not Requires): the menu must still appear if histb_vdp fails.
+# Deliberately NOT ordered Before anything and NOT After by any session unit (that would deadlock).
+[Unit]
+Description=Q10: session chooser at boot
+After=q10-keymap.service q10-video-stack.service  systemd-user-sessions.service
+Wants=q10-video-stack.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/q10-mode boot
+
+[Install]
+WantedBy=multi-user.target

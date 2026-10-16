@@ -1,0 +1,15 @@
+# Q10: load the remote + front-panel keymap into the IR receiver (rc0, ir-hix5hd2).
+# The front touch keys (TCH68 sub-board) are NOT a key matrix: they transmit NEC IR codes into the
+# same receiver as the remote (measured 2026-10-11: left 0x1007, up 0x1045, right 0x1001,
+# down 0x1055, OK 0x1041, back 0x1000, menu 0x1005) — so one keymap serves both.
+[Unit]
+Description=Q10: remote + front-panel keymap
+ConditionPathExists=/sys/class/rc/rc0
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ir-keytable -s rc0 -c -w /etc/rc_keymaps/himedia_q10.toml
+
+[Install]
+WantedBy=multi-user.target

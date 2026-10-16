@@ -1,0 +1,19 @@
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -932,6 +932,16 @@
+ 
+ 	arch_timer_read_counter = rd;
+ 	clocksource_counter.vdso_clock_mode = vdso_default;
++	/*
++	 * The 32-bit ARM vDSO always reads the VIRTUAL counter. If the kernel's clocksource is
++	 * the physical one, userspace and kernel only agree while CNTVOFF is 0 — which the arm32
++	 * HYP stub normally guarantees, and some firmware does not: on HiSilicon Hi3798CV200 every
++	 * clock_gettime() from userspace read ~933 s off the kernel's own time, so NTP and
++	 * clock_settime() misbehaved. Fall back to the syscall in that case.
++	 */
++	if (IS_ENABLED(CONFIG_ARM) && rd != arch_counter_get_cntvct &&
++	    rd != arch_counter_get_cntvct_stable)
++		clocksource_counter.vdso_clock_mode = VDSO_CLOCKMODE_NONE;
+ 
+ 	width = arch_counter_get_width();
+ 	clocksource_counter.mask = CLOCKSOURCE_MASK(width);

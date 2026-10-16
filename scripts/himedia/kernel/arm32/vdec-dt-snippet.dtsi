@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device-tree nodes for the Hi3798CV200 video decoder (VDEC) and the video
+ * post-processing engine (VPSS), for OUR AArch32 tree.
+ *
+ * Source: hi3798cv200.dtsi of the community 6.12 tree (nodes vdec@8c30000 and
+ * vpss@8cb0000) and its bindings Documentation/devicetree/bindings/media/
+ * hisilicon,hi3798cv200-{vdec,vpss}.yaml (shipped by patch 0008).  Addresses
+ * are SOC-RELATIVE like the rest of hi3798cv200.dtsi
+ * (soc ranges = <0x0 0xf0000000 0x10000000>).
+ *
+ * Needs, in this order: 0008 (drivers), 0009 (CRG clocks 57..60 + vpss_mux).
+ * Not tested on hardware: everything below is [read] from the community tree
+ * and the vendor register map, or tagged [inferred].  It compiles with dtc
+ * against our dtsi + dts (see docs/261011-himedia-vdec-port-report.md).
+ *
+ * HOW TO USE
+ *   PART A  nodes.  Keep this file's `&soc { ... };` form in the board dts, or
+ *           paste the two node bodies into the soc node of hi3798cv200.dtsi.
+ *           Both nodes are disabled in PART A.
+ *   PART B  enable them (board dts).
+ *   PART C  (optional) memory: bigger default CMA and a dedicated pool.
+ *           Skip the pool for first bring-up.
+ */
+
+/* ======================================================================== */
+/* PART A: the nodes                                                        */
+/* ======================================================================== */
+
+&soc {
+	/*
+	 * VDH video decoder + SCD (stream code detector) + BPD (bit-plane
+	 * decoder, VC-1) + VDH MMU.  One register window: the driver programs
+	 * all four from this single mapping (vendor sysconfig.h: VDM 0xf8c30000,
+	 * SCD 0xf8c3c000, BPD 0xf8c3d000, MMU at +0xf000).
+	 */
+	vdec: video-codec@8c30000 {
+		/* Matched by histb-vdec; see the binding added by 0008. */
+		compatible = "hisilicon,hi3798cv200-vdec";
+
+		/* Soc-relative 0x8c30000 = physical 0xf8c30000, 64 KiB. [read] */
+		reg = <0x8c30000 0x10000>;
+
+		/*
+		 * Three SPIs, GIC numbers (the vendor numbers are these minus 32):
+		 *   vdh = 95   decode-done / error of the pixel engine
+		 *   scd = 104  stream code detector
+		 *   mmu = 149  VDH MMU fault (non-secure)
+		 * The driver requests "vdh" only (platform_get_irq_byname) and reads
+		 * the SCD/MMU status registers from that handler; "scd" and "mmu" are
+		 * required by the binding but not requested. [read] histb-vdec-core.c
+		 */
+		interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "vdh", "scd", "mmu";
+
+		/*
+		 * Gates from patch 0009: CRG 0x78 bit 0, CRG 0x78 bit 1, CRG 0x88
+		 * bit 0.  The driver also writes the VDH clock-select field
+		 * (CRG 0x78 bits [9:8]) itself through the crg regmap, so these
+		 * gates have no rate parent.
+		 */
+		clocks = <&crg HISTB_VDH_CLK>,
+			 <&crg HISTB_VDH_DSP_CLK>,
+			 <&crg HISTB_BPD_CLK>;
+		clock-names = "vdh", "dsp", "bpd";
+
+		/*
+		 * crg reset cells are <register-offset bit> in OUR dtsi
+		 * (#reset-cells = <2>), as in the community tree:
+		 *   vdh = CRG 0x78 bit 4   decode engine
+		 *   scd = CRG 0x78 bit 5   stream code detector
+		 *   mfd = CRG 0x78 bit 6   main format decoding engine
+		 *   bpd = CRG 0x88 bit 4   bit-plane decoder
+		 * The driver also pulses the same bits by hand through the crg
+		 * regmap for a full pipeline reset and waits for the ack in
+		 * CRG 0x174 (HISTB_CRG_RESET_STATUS). [read]
+		 */
+		resets = <&crg 0x78 4>, <&crg 0x78 5>,
+			 <&crg 0x78 6>, <&crg 0x88 4>;
+		reset-names = "vdh", "scd", "mfd", "bpd";
+
+		/*
+		 * Mandatory: the tile -> linear step lives in the VPSS and the
+		 * decoder takes a reference on it (histb_vpss_get()).  Probe
+		 * defers until the vpss device is bound.
+		 */
+		hisilicon,vpss = <&vpss>;
+
+		/*
+		 * No `iommus`: the VDH MMU stays in bypass for every codec in this
+		 * port (only the removed AVS path used it).  The driver also does
+		 * syscon_regmap_lookup_by_compatible("hisilicon,hi3798cv200-crg"),
+		 * which our crg node already satisfies ("hisilicon,hi3798cv200-crg",
+		 * "syscon", "simple-mfd") - nothing to add.
+		 *
+		 * `memory-region = <&vdec_pool>;` is added by PART C if wanted.
+		 */
+		status = "disabled";
+	};
+
+	/*
+	 * VPSS: converts the decoder's native tile surfaces to linear NV12/P010
+	 * (the only way the CAPTURE queue can be linear), does ZME scaling and
+	 * field-rate deinterlace.  It has no /dev node of its own.
+	 */
+	vpss: video-post-processing@8cb0000 {
+		compatible = "hisilicon,hi3798cv200-vpss";
+
+		/* Soc-relative 0x8cb0000 = physical 0xf8cb0000, 64 KiB. [read] */
+		reg = <0x8cb0000 0x10000>;
+
+		/* GIC SPI 93, level high. [read] */
+		interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+
+		/*
+		 * Gate in CRG 0xf0 bit 0, fed by vpss_mux (CRG 0xf0 bits [9:8] ->
+		 * 333 / 400 / 300 MHz).  Both come from patch 0009.
+		 */
+		clocks = <&crg HISTB_VPSS_CLK>;
+		clock-names = "core";
+
+		/* CRG 0xf0 bit 4. [read] */
+		resets = <&crg 0xf0 4>;
+		reset-names = "core";
+
+		status = "disabled";
+	};
+};
+
+/* ======================================================================== */
+/* PART B: board dts - switch both on                                       */
+/* ======================================================================== */
+
+&vpss {
+	status = "okay";
+};
+
+&vdec {
+	/* memory-region = <&vdec_pool>;   <- PART C, optional */
+	status = "okay";
+};
+
+/* ======================================================================== */
+/* PART C (optional): memory                                                */
+/* ======================================================================== */
+
+/*
+ * What the driver allocates, and from where (this decides whether 1080p works
+ * and 4K does not):
+ *
+ *  - dma_alloc_coherent():   message pools, CABAC tables, VP9/VP8 probability
+ *                            tables, per-context working buffers (kilobytes to
+ *                            a few MiB each).  Comes from `memory-region` when
+ *                            present, else from the default CMA.
+ *  - dma_alloc_noncoherent(): the decoded TILE surfaces and the motion-vector
+ *                            (PMV) buffers, one per CAPTURE buffer plus
+ *                            references.  The community tree measured that
+ *                            these BYPASS memory-region and always come from
+ *                            the DEFAULT CMA.  1080p = ~3.2 MiB of contiguous
+ *                            pages per frame, 4096x2304 = ~13 MiB.
+ *
+ * So the number that matters is the default CMA, not vdec_pool.  Today's
+ * kernel has CONFIG_CMA_SIZE_MBYTES=64 (boot log: CMA at 0x76800000).  A 1080p
+ * H.264 reference set (about 16 frames) is ~50 MiB: tight, possible when
+ * nothing else uses CMA.  4K H.264/HEVC needs roughly 200 MiB; the community
+ * tree measured 192 MiB as the working size.  This board has 2 GiB of RAM and
+ * the SoC masters were shown to reach high RAM (see the dma-ranges comment in
+ * hi3798cv200.dtsi), so the 1 GiB-aperture restriction of the arm64 tree is
+ * assumed NOT to apply. [inferred from the GMAC/xHCI note in the dtsi; not
+ * tested for the VDH itself - if probe prints "outside the DMA aperture" or
+ * the first frame fails with -EINVAL, pin both pools below 0x40000000.]
+ */
+/ {
+	reserved-memory {
+		/*
+		 * Default CMA, enlarged.  A node with `linux,cma-default` replaces
+		 * CONFIG_CMA_SIZE_MBYTES.  192 MiB = 4K H.264/HEVC.  Use 0x04000000
+		 * (64 MiB, today's size) for 1080p only.  Placement is dynamic in the
+		 * free area below the vendor media zone, so the framebuffer
+		 * (0x7b68c000) and ramoops (0x7a800000) stay untouched.
+		 */
+		linux_cma: linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x0c000000>;
+			alignment = <0x00800000>;
+			alloc-ranges = <0x20000000 0x56000000>; /* 0x20000000..0x76000000 */
+			linux,cma-default;
+		};
+
+		/*
+		 * Dedicated NON-reusable pool for the coherent allocations, so they
+		 * never wait for the page allocator to migrate user pages out of a
+		 * reusable CMA area (the community tree saw 765-page requests fail
+		 * after a desktop had run a while).  Not needed for bring-up.
+		 * To use it, uncomment and add `memory-region = <&vdec_pool>;` to
+		 * the &vdec node above.
+		 */
+		/*
+		vdec_pool: vdec-pool {
+			compatible = "shared-dma-pool";
+			size = <0x04000000>;		// 64 MiB
+			alignment = <0x00400000>;
+			alloc-ranges = <0x10000000 0x10000000>;
+		};
+		*/
+	};
+};

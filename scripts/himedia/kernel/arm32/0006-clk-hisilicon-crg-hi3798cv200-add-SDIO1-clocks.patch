@@ -1,0 +1,56 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: crg-hi3798cv200 — add the SDIO1 clocks
+
+The second SD/SDIO controller (0xf9c40000, SPI 86) carries the AP6255 WiFi module on the
+HiMedia Q10 Pro. Its clock register is PERI_CRG163 at CRG offset 0x28c, laid out exactly like
+SDIO0's at 0x9c (vendor clk-hi3798cv200.c / himci_hi3798cv2x.c): bit 0 BIU gate, bit 1 CIU
+gate, bits [9:8] rate mux {100, 50, 150, 166.5 MHz}, bit 4 soft reset (reachable through the
+CRG reset cells already). Mainline modelled only SDIO0 and eMMC, so no device tree could
+describe the WiFi controller. Ids 55/56 follow the SATA ids of patch 0001; mux id 87 follows
+the driver-private range.
+
+diff --color -ru a/drivers/clk/hisilicon/crg-hi3798cv200.c b/drivers/clk/hisilicon/crg-hi3798cv200.c
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c	2026-10-11 16:06:22
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c	2026-10-11 16:06:32
+@@ -38,6 +38,7 @@
+ #define HI3798CV200_FIXED_166P5M		84
+ #define HI3798CV200_SDIO0_MUX			85
+ #define HI3798CV200_COMBPHY0_MUX		86
++#define HI3798CV200_SDIO1_MUX			87
+ 
+ #define HI3798CV200_CRG_NR_CLKS			128
+ 
+@@ -83,6 +84,9 @@
+ 	{ HI3798CV200_SDIO0_MUX, "sdio0_mux", sdio_mux_p,
+ 		ARRAY_SIZE(sdio_mux_p), CLK_SET_RATE_PARENT,
+ 		0x9c, 8, 2, 0, sdio_mux_table, },
++	{ HI3798CV200_SDIO1_MUX, "sdio1_mux", sdio_mux_p,
++		ARRAY_SIZE(sdio_mux_p), CLK_SET_RATE_PARENT,
++		0x28c, 8, 2, 0, sdio_mux_table, },
+ };
+ 
+ static u32 mmc_phase_regvals[] = {0, 1, 2, 3, 4, 5, 6, 7};
+@@ -120,6 +124,10 @@
+ 			CLK_SET_RATE_PARENT, 0x9c, 0, 0, },
+ 	{ HISTB_SDIO0_CIU_CLK, "clk_sdio0_ciu", "sdio0_mux",
+ 		CLK_SET_RATE_PARENT, 0x9c, 1, 0, },
++	{ HISTB_SDIO1_BIU_CLK, "clk_sdio1_biu", "200m",
++		CLK_SET_RATE_PARENT, 0x28c, 0, 0, },
++	{ HISTB_SDIO1_CIU_CLK, "clk_sdio1_ciu", "sdio1_mux",
++		CLK_SET_RATE_PARENT, 0x28c, 1, 0, },
+ 	/* EMMC */
+ 	{ HISTB_MMC_BIU_CLK, "clk_mmc_biu", "200m",
+ 		CLK_SET_RATE_PARENT, 0xa0, 0, 0, },
+diff --color -ru a/include/dt-bindings/clock/histb-clock.h b/include/dt-bindings/clock/histb-clock.h
+--- a/include/dt-bindings/clock/histb-clock.h	2026-10-11 16:06:22
++++ b/include/dt-bindings/clock/histb-clock.h	2026-10-11 16:06:32
+@@ -68,6 +68,10 @@
+ #define HISTB_SATA_CKO_ALIVE_CLK	53
+ #define HISTB_SATA_TX0_CLK		54
+ 
++/* SDIO1 = the controller at 0xf9c40000 carrying the AP6255 WiFi; gates in CRG 0x28c bits 0/1. */
++#define HISTB_SDIO1_BIU_CLK		55
++#define HISTB_SDIO1_CIU_CLK		56
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2

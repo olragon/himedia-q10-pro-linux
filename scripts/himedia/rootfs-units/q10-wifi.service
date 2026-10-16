@@ -1,0 +1,14 @@
+# Q10: power the AP6255 (GPIO4_6 = WL_REG_ON) at 1.8 V SDIO pads, then bind SDIO1 -> wlan0.
+[Unit]
+Description=Q10: WiFi module power + SDIO pad voltage
+After=systemd-modules-load.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/q10-wifi-up
+
+[Install]
+WantedBy=multi-user.target

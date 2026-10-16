@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs INSIDE cage: Chromium as a native Wayland client with Chromium's V4L2 stateless decoder on the
+# VDH's multi-planar node (/dev/video1). Measured 2026-10-12: H.264 1080p60 26% box CPU (software 82%),
+# VP9 1080p 15% (49%). On the X11 desktop the same decode shows a blank picture (ANGLE has no dma-buf
+# import), which is why the web session exists. docs/261012-himedia-q10-hw-optimizations.md item 7
+# The preload shim makes Mesa gbm dma-buf mmaps read-write (Chromium maps its frames RW; EACCES otherwise).
+P=/usr/local/lib/q10/drm-rdwr-preload.so; [ -f $P ] && export LD_PRELOAD=$P
+export MESA_GLES_VERSION_OVERRIDE=3.0
+# A session stop kills Chromium, which it records as a crash ("Restore pages?" on the next start).
+PREF=$HOME/.config/chromium/Default/Preferences
+[ -f "$PREF" ] && sed -i 's/"exited_cleanly":false/"exited_cleanly":true/; s/"exit_type":"Crashed"/"exit_type":"Normal"/' "$PREF"
+exec chromium --ozone-platform=wayland --no-first-run --start-fullscreen \
+  --enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL \
+  --ignore-gpu-blocklist --password-store=basic --no-sandbox --test-type ${Q10_WEB_URL:-https://www.google.com}

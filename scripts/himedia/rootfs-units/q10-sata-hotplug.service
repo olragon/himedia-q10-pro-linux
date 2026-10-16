@@ -1,0 +1,14 @@
+# SATA bay hotplug: attach + mount a disk inserted while the box runs, detach a removed one.
+# Starts after q10-sata.service has loaded the AHCI driver (guarded).
+[Unit]
+Description=Q10: SATA hotplug (insert / remove the disk while running)
+After=q10-sata.service
+Wants=q10-sata.service
+
+[Service]
+ExecStart=/usr/local/sbin/q10-sata-hotplug watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

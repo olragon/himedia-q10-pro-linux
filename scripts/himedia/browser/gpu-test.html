@@ -1,0 +1,25 @@
+<!doctype html><meta charset=utf-8><title>q10 gpu test</title>
+<style>
+ body{margin:0;background:#123;color:#fff;font:16px sans-serif;overflow:hidden}
+ .box{position:absolute;width:120px;height:120px;border-radius:16px;background:linear-gradient(45deg,#f60,#09f);
+      box-shadow:0 8px 24px #0008;animation:spin 3s linear infinite}
+ @keyframes spin{from{transform:translate(0,0) rotate(0)}50%{transform:translate(1500px,700px) rotate(180deg)}to{transform:translate(0,0) rotate(360deg)}}
+ canvas{position:absolute;right:0;bottom:0;width:960px;height:540px}
+ #o{position:absolute;left:8px;top:8px}
+</style>
+<div id=o>fps …</div><canvas id=c width=960 height=540></canvas>
+<script>
+// 40 composited CSS layers + a WebGL triangle field; window.__fps is read over DevTools.
+for(let i=0;i<40;i++){const d=document.createElement('div');d.className='box';d.style.left=(i*37%1700)+'px';d.style.top=(i*53%900)+'px';d.style.animationDelay=(-i*0.17)+'s';document.body.appendChild(d)}
+const gl=document.getElementById('c').getContext('webgl');window.__webgl=!!gl;
+if(gl){const vs=gl.createShader(gl.VERTEX_SHADER);gl.shaderSource(vs,'attribute vec2 p;uniform float t;void main(){float c=cos(t),s=sin(t);gl_Position=vec4(mat2(c,-s,s,c)*p,0,1);}');gl.compileShader(vs);
+ const fs=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(fs,'precision mediump float;uniform float t;void main(){gl_FragColor=vec4(0.5+0.5*sin(t+gl_FragCoord.x*0.02),0.5+0.5*cos(t*1.3),0.6,1);}');gl.compileShader(fs);
+ const pr=gl.createProgram();gl.attachShader(pr,vs);gl.attachShader(pr,fs);gl.linkProgram(pr);gl.useProgram(pr);
+ const v=[];for(let i=0;i<3000;i++){const a=Math.random()*6.28,r=Math.random();v.push(r*Math.cos(a),r*Math.sin(a))}
+ gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW);
+ const l=gl.getAttribLocation(pr,'p');gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);var ut=gl.getUniformLocation(pr,'t');}
+let n=0,t0=performance.now();window.__fps=0;
+function f(ts){if(gl){gl.uniform1f(ut,ts/1000);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,0,3000)}
+ n++;const dt=ts-t0;if(dt>=2000){window.__fps=Math.round(n*10000/dt)/10;document.getElementById('o').textContent='fps '+window.__fps;n=0;t0=ts}
+ requestAnimationFrame(f)}requestAnimationFrame(f);
+</script>

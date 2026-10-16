@@ -1,0 +1,14 @@
+#!/bin/sh
+# Pick the Xorg display config for whichever scan-out driver owns the HDMI right now:
+#   histb-vdp loaded  -> 10-q10-vdp.conf       (KMS planes + glamor on panfrost)
+#   otherwise         -> 10-q10-simpledrm.conf (boot framebuffer, software rendering)
+# Run as the desktop unit's ExecStartPre. The fallback is always the config that has worked.
+D=/etc/X11/xorg.conf.d; S=/usr/local/share/q10-desktop
+if [ -e /dev/dri/by-path/platform-f8cc0000.display-controller-card ] && [ -e /dev/dri/renderD128 ]; then
+  c=10-q10-vdp.conf
+else
+  c=10-q10-simpledrm.conf
+fi
+rm -f $D/10-q10-simpledrm.conf $D/10-q10-vdp.conf $D/10-q10-display.conf
+ln -s $S/$c $D/10-q10-display.conf
+echo "q10-xorg-select: $c" > /dev/kmsg

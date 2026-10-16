@@ -1,0 +1,27 @@
+[Unit]
+Description=Q10 session: Web (Chromium on Wayland in cage, hardware video)
+Requires=q10-video-stack.service
+After=q10-video-stack.service systemd-user-sessions.service
+Conflicts=q10-desktop.service q10-kodi.service
+AssertPathExists=/usr/bin/chromium
+AssertPathExists=/usr/bin/cage
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Environment=HOME=/root LIBSEAT_BACKEND=builtin XDG_RUNTIME_DIR=/run/q10-web WLR_LIBINPUT_NO_DEVICES=1
+Environment=WLR_DRM_DEVICES=/dev/dri/by-path/platform-f8cc0000.display-controller-card
+RuntimeDirectory=q10-web
+RuntimeDirectoryMode=0700
+StandardInput=tty-force
+# tty10: logind spawns gettys on tty1-6 (SIGHUP), tty7 = X, tty8 = menu, tty9 = Android; q10-mode chvt's here
+TTYPath=/dev/tty10
+TTYReset=yes
+TTYVHangup=yes
+ExecStartPre=/bin/sh -c 'echo 3 > /proc/sys/kernel/printk'
+ExecStart=/usr/bin/cage -- /usr/local/lib/q10-session/q10-web-run
+ExecStopPost=/bin/sh -c 'echo 7 > /proc/sys/kernel/printk'
+ExecStopPost=-/usr/local/sbin/q10-mode exited web
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15

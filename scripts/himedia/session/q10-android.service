@@ -1,0 +1,38 @@
+# Q10 session: Android 13 (Waydroid / LineageOS 20) full screen through the cage kiosk compositor.
+# AssertPath*: when Waydroid or cage is missing the unit FAILS cleanly (Condition* would "succeed" doing nothing).
+[Unit]
+Description=Q10 session: Android (Waydroid in cage)
+Requires=q10-video-stack.service
+Wants=waydroid-container.service
+After=q10-video-stack.service waydroid-container.service systemd-user-sessions.service
+# No Conflicts= with desktop/kodi: leaving Android PAUSES it (q10-mode) and cage must stay alive.
+AssertPathExists=/usr/bin/waydroid
+AssertPathExists=/usr/bin/cage
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+# cage as root needs libseat's builtin backend and a real VT on stdin
+Environment=LIBSEAT_BACKEND=builtin XDG_RUNTIME_DIR=/run/q10-android WLR_LIBINPUT_NO_DEVICES=1
+# wlroots otherwise also opens simpledrm (card0) and the GPU node; the TV is the VDP (2026-10-12)
+Environment=WLR_DRM_DEVICES=/dev/dri/by-path/platform-f8cc0000.display-controller-card
+RuntimeDirectory=q10-android
+RuntimeDirectoryMode=0700
+StandardInput=tty-force
+# tty9: logind auto-spawns a getty on tty1-6 when one becomes active, and its vhangup SIGHUPs us (2026-10-12)
+TTYPath=/dev/tty9
+TTYReset=yes
+TTYVHangup=yes
+# No chvt here: this process owns tty9 (tty-force) and the VT hangup kills it with SIGHUP
+# (2026-10-12). q10-mode switches to VT 9 before starting the unit.
+ExecStartPre=/bin/sh -c 'echo 3 > /proc/sys/kernel/printk; rm -f /run/q10/android.paused'
+ExecStart=/usr/bin/cage -- /usr/local/lib/q10-session/q10-android-run
+# a frozen container cannot shut down cleanly: thaw first
+ExecStopPost=-/usr/bin/waydroid container unfreeze
+ExecStopPost=-/bin/rm -f /run/q10/android.paused
+ExecStopPost=-/usr/bin/waydroid session stop
+ExecStopPost=/bin/sh -c 'echo 7 > /proc/sys/kernel/printk'
+ExecStopPost=-/usr/local/sbin/q10-mode exited android
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30

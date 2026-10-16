@@ -1,0 +1,957 @@
+LOCAL PATCH (not submitted anywhere): drm: hisilicon: histb-vdp - mode setting through the HDMI bridge
+
+0011 adopts the bootloader's 1080p and never writes DHD0 timing.  This adds mode setting on top,
+without changing what a plain `modprobe histb_vdp` does.
+
+  * With an HDMI bridge in the device tree (ports: vdp port 0 -> hdmi port 0) the connector is made
+    from the bridge chain (drm_bridge_connector): EDID modes, HDR_OUTPUT_METADATA, Colorspace,
+    max bpc, infoframes.  The mode the bootloader started is put first and is the only PREFERRED
+    mode, so the console client's first commit is a commit for the mode already running.
+  * "The mode DHD0 already runs" is compared WITH the pixel clock (DRM_MODE_MATCH_CLOCK): 148.5 MHz 60.00 Hz and
+    the bootloader's 148.352 MHz 59.94 Hz share every timing and need different PLL plans.
+  * A commit for the mode DHD0 already runs does what it always did: NOTHING to the hardware.
+  * A commit for another mode (histb_vdp_mode.c):
+      1. retimes the HDMI pixel clock (clk_set_rate on the HPLL).  A PLL that does not lock has
+         already been rolled back by the clock driver; the commit then touches nothing else;
+      2. the FIRST time: VDP soft reset (CRG 0xd8 bit 30), AXI / low-power setup, the RGB identity
+         colour path and the G0 -> GP0 -> mixer route of the community driver.  The community
+         HDMI TX setup assumes that RGB chain and the bootloader runs a different one (hdmi_mode 0,
+         DHD0 colour conversion on), so VDP and TX are switched together;
+      3. every time: DHD0 interface off, HSYNC1/2 VSYNC PWR, GP0 size, interface on, the vblank
+         threshold line for the new height.
+    The plane updates the commit helpers run BEFORE crtc_enable are replayed afterwards (a reset
+    wipes them; V0 derives its VP0 size from the mode).
+  * allow_scale is unchanged.  New: modeset=0 (module parameter) or a device tree without ports
+    keeps the original fixed-mode connector; the VDP reset line and the "pixel" clock are optional.
+  * the boot mode's clock is taken from the running PLL, not assumed: the bootloader's "1080p60"
+    runs 148.352 MHz = 59.94 Hz, so the sink's 59.94 Hz mode is the one recognised as running.
+  * connector max bpc defaults to 8 (the pipe is 8 bit); the bridge's 12 only creates the HDR
+    property.
+  * rmmod after a mode change leaves the planes off (the bootloader's buffer and chain are gone).
+  * debugfs histb_vdp_regs prints the mode, owned and the pixel clock.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain), W=1.
+Needs 0011, 0012, 0015, 0016.
+
+--- a/drivers/gpu/drm/hisilicon/histb/Kconfig
++++ b/drivers/gpu/drm/hisilicon/histb/Kconfig
+@@ -2,7 +2,10 @@
+ config DRM_HISI_HISTB_VDP
+ 	tristate "DRM Support for HiSilicon Hi3798CV200 VDP (adopts the bootloader display)"
+ 	depends on DRM && OF && (ARCH_HISI || COMPILE_TEST)
++	select DRM_BRIDGE_CONNECTOR
+ 	select DRM_CLIENT_SELECTION
++	select DRM_DISPLAY_HELPER
++	select DRM_DISPLAY_HDMI_STATE_HELPER
+ 	select DRM_GEM_DMA_HELPER
+ 	select DRM_KMS_HELPER
+ 	help
+@@ -13,5 +16,9 @@
+ 	  video layer as an NV12/NV21 overlay plane that scans out
+ 	  physically contiguous (CMA) buffers directly.
+ 
++	  With the HiSilicon HDMI bridge (DRM_HISI_HISTB_HDMI) it also offers the
++	  sink's EDID modes and switches between them; a commit for the mode the
++	  bootloader started still touches no hardware.
++
+ 	  When loaded it takes over from simpledrm.  If M is selected the
+ 	  module will be called histb-vdp.
+--- a/drivers/gpu/drm/hisilicon/histb/Makefile
++++ b/drivers/gpu/drm/hisilicon/histb/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-histb-vdp-y := histb_vdp_drv.o histb_vdp_hw.o histb_vdp_zme.o
++histb-vdp-y := histb_vdp_drv.o histb_vdp_hw.o histb_vdp_mode.o histb_vdp_zme.o
+ 
+ obj-$(CONFIG_DRM_HISI_HISTB_VDP) += histb-vdp.o
+--- a/drivers/gpu/drm/hisilicon/histb/histb_vdp.h
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp.h
+@@ -18,9 +18,11 @@
+ #include <linux/bits.h>
+ #include <linux/clk.h>
+ #include <linux/io.h>
++#include <linux/reset.h>
+ #include <linux/spinlock.h>
+ 
+ #include <drm/drm_connector.h>
++#include <drm/drm_modeset_helper_vtables.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_device.h>
+ #include <drm/drm_encoder.h>
+@@ -28,6 +30,25 @@
+ #include <drm/drm_plane.h>
+ 
+ /* ---- global block ------------------------------------------------------ */
++#define VDP_VOCTRL		0x0000
++#define  VOCTRL_TWOCHN_EN	BIT(24)	/* two pixels per clock [read community histb-vdp.c:177] */
++#define  VOCTRL_TWOCHN_MODE	BIT(25)
++#define  VOCTRL_CLK_GATE_EN	BIT(31)
++#define VDP_VERSION1		0x0020	/* both read 0 when a soft reset has finished [read CM:535] */
++#define VDP_VERSION2		0x0024
++#define VDP_VOMIDORDER		0x0028
++#define  VOMIDORDER_MID_EN	BIT(3)
++#define VDP_VOLOWPOWER_CTRL	0x002c
++#define  VOLOWPOWER_DEFAULT	0x00005b2b
++#define VDP_VOAXICTRL		0x0030
++#define  VOAXICTRL_MASK		(GENMASK(11, 0) | BIT(15) | GENMASK(27, 16) | BIT(31))
++#define  VOAXICTRL_VALUE	0x07ff87ff
++#define VDP_VOAXICTRL1		0x0034
++#define  VOAXICTRL1_MASK	(GENMASK(11, 0) | GENMASK(27, 16))
++#define  VOAXICTRL1_VALUE	0x07ff07ff
++#define VDP_VOMASTERSEL		0x0038
++#define VDP_VO_MUX		0x0100
++#define  VO_MUX_HDMI_SEL	BIT(3)
+ #define VDP_VOINTSTA		0x0004	/* [read] hi_reg_vdp.h */
+ #define VDP_VOMSKINTSTA		0x0008	/* write 1 = clear (community: acks vblank) */
+ #define VDP_VOINTMSK		0x000c
+@@ -128,6 +149,24 @@
+ #define VDP_CVM1_LMS2IPT_MAX	0x3a30
+ #define VDP_CVM1_LMS2IPT_OUT_DC(n) (0x3a34 + 4 * (n))
+ #define VDP_HDR_UPD		0x3f84		/* bit0 regup */
++/* graphics colour path, only touched when this driver takes the pipe over [read CM:99-110] */
++#define VDP_GDM_CTRL		0x3700
++#define  GDM_ENABLES		GENMASK(3, 0)
++#define VDP_GDM_RGB2LMS_CTRL	0x3800
++#define VDP_CVM1_RGB2YUV_CTRL	0x3d00
++#define VDP_CVM2_RGB2YUV_CTRL	0x3e00
++#define VDP_CVM2_RGB2YUV_COEF(n) (0x3e04 + 4 * (n))
++#define VDP_CVM2_RGB2YUV_SCALE2P 0x3e28
++#define VDP_CVM2_RGB2YUV_MIN	0x3e2c
++#define VDP_CVM2_RGB2YUV_MAX	0x3e30
++#define VDP_CVM2_RGB2YUV_OUT_DC(n) (0x3e34 + 4 * (n))
++#define VDP_HDR_CTRL		0x3f80
++#define  HDR_ENABLES		GENMASK(31, 30)
++#define  CVM_PIPE_ENABLES	GENMASK(5, 0)
++#define  CVM_ENABLE		BIT(0)
++#define  CVM2_CSC_UNITY		BIT(14)
++#define  CVM2_CSC_PRECISION	15
++#define  CVM2_CSC_SCALE_EN	BIT(5)
+ 
+ /* ---- G0: graphics layer 0 (the boot-logo layer) [read community histb-vdp.c:69-91] ---- */
+ #define VDP_G0_CTRL		0x7000
+@@ -159,11 +198,31 @@
+ #define VDP_G0_VFPOS		0x7088
+ #define VDP_G0_VLPOS		0x708c
+ #define VDP_G0_ALPHA		0x7094
++#define VDP_G0_CSC_IDC		0x70c0
++#define  CSC_ENABLE_G0		BIT(22)
+ 
+ /* ---- GP0: graphics processor between G0 and the mixer (left as the bootloader set it) ---- */
++#define VDP_GP0_CTRL		0x8000
++#define  GP0_CTRL_READ_PROG	BIT(31)
++/* CV200 Linux HIFB/PQ channel A: ZME -> CSC, mux1=3, mux2=0, A=2, B=1 [read CM:130-141] */
++#define  GP0_ROUTE_ZME_CSC	0x1203	/* mux1 [1:0]=3, mux2 [5:4]=0, A [9:8]=2, B [13:12]=1 */
+ #define VDP_GP0_UPD		0x8004
++#define VDP_GP0_ORESO		0x8008
++#define VDP_GP0_IRESO		0x800c
++#define VDP_GP0_GALPHA		0x8020
++#define VDP_GP0_DFPOS		0x8100
++#define VDP_GP0_DLPOS		0x8104
++#define VDP_GP0_VFPOS		0x8108
++#define VDP_GP0_VLPOS		0x810c
++#define VDP_GP0_CSC_IDC		0x8120
++#define  CSC_ENABLE_GP0		BIT(22)
++#define VDP_GP0_ZME_HSP		0x8140
++#define VDP_GP0_ZME_VSP		0x814c
++#define  GP0_ZME_ENABLE		BIT(31)
+ 
+ /* ---- mixers [read hi_reg_vdp.h offsets; prio fields VT vdp_hal_comm.c:784] ---- */
++#define VDP_MIXG0_MIX		0xb208
++#define VDP_CBM_BKG1		0xb400
+ #define VDP_MIXV0_MIX		0xb008	/* [3:0] prio0, [7:4] prio1: value = layer id + 1 */
+ #define VDP_CBM_MIX1		0xb408	/* [3:0] prio0 (bottom), [7:4] prio1: VP0 = 1, GP0 = 2 */
+ #define  CBM_LAYER_VP0		0x1
+@@ -171,13 +230,27 @@
+ 
+ /* ---- DHD0: HD display channel (timing generator; never written except VTTHD) ---- */
+ #define VDP_DHD0_CTRL		0xc000
++#define  DHD0_CTRL_REGUP	BIT(0)
+ #define  DHD0_CTRL_IOP		BIT(4)	/* progressive */
++#define  DHD0_CTRL_HDMI_MODE	BIT(14)
++#define  DHD0_CTRL_TWOCHN_DEBUG	BIT(15)
++#define  DHD0_CTRL_P2I		BIT(28)
++#define  DHD0_CTRL_CBAR		(BIT(29) | BIT(30))
+ #define  DHD0_CTRL_INTF_EN	BIT(31)
+ #define VDP_DHD0_VSYNC		0xc004
+ #define VDP_DHD0_HSYNC1		0xc008
+ #define VDP_DHD0_HSYNC2		0xc00c
++#define VDP_DHD0_VPLUS		0xc010
+ #define VDP_DHD0_PWR		0xc014
+ #define VDP_DHD0_VTTHD		0xc01c
++#define VDP_DHD0_SYNC_INV	0xc020
++#define  DHD0_SYNC_INV_HSYNC	BIT(13)	/* the DHD default, also what the bootloader leaves [measured 0x2000] */
++#define VDP_DHD0_DATA_SEL	0xc02c
++#define VDP_DHD0_CSC_IDC	0xc040
++#define  CSC_ENABLE_DHD0	BIT(22)
++#define VDP_DHD0_HDMI_CLIP_L	0xc090
++#define VDP_DHD0_HDMI_CLIP_H	0xc094
++#define  DHD0_CLIP_FULL		GENMASK(29, 0)
+ 
+ #define VDP_POS(x, y)		(((x) & 0xfff) | (((y) & 0xfff) << 12))
+ #define VDP_SIZE(w, h)		VDP_POS((w) - 1, (h) - 1)
+@@ -193,6 +266,8 @@
+ 	u32 vp0_ctrl;
+ };
+ 
++struct drm_bridge;
++
+ struct histb_vdp {
+ 	struct drm_device drm;
+ 	void __iomem *base;
+@@ -206,8 +281,22 @@
+ 	struct drm_crtc crtc;
+ 	struct drm_encoder encoder;
+ 	struct drm_connector connector;
+-	struct drm_display_mode mode;	/* adopted from DHD0, never changed */
++	struct drm_display_mode mode;	/* the mode DHD0 is running NOW (adopted at probe, then ours) */
++	struct drm_display_mode boot_mode; /* what the bootloader started: preferred mode, never changes */
+ 
++	/*
++	 * Mode setting (module parameter "modeset", needs an HDMI bridge in the device tree).
++	 * Off = the legacy fixed-mode connector, nothing below is used.
++	 */
++	bool modeset;
++	bool owned;			/* the pipe was reset and programmed by this driver */
++	struct drm_bridge *bridge;
++	struct drm_connector *bconn;	/* connector made from the bridge chain */
++	struct clk *pixel;		/* HDMI pixel clock: this driver sets its RATE, the bridge gates it */
++	struct reset_control *reset;	/* VDP soft reset, CRG 0xd8 bit 30 */
++	struct drm_connector_helper_funcs conn_helpers; /* the bridge connector's, get_modes wrapped */
++	const struct drm_connector_helper_funcs *bridge_conn_helpers;
++
+ 	spinlock_t irq_lock;		/* VOINTMSK read-modify-write */
+ 	bool vblank_on;
+ 
+@@ -249,11 +338,16 @@
+ void histb_vdp_hw_v0_disable(struct histb_vdp *vdp);
+ void histb_vdp_hw_dump(struct histb_vdp *vdp, struct seq_file *m);
+ 
++/* histb_vdp_mode.c */
++enum drm_mode_status histb_vdp_mode_valid(const struct drm_display_mode *mode);
++int histb_vdp_hw_set_mode(struct histb_vdp *vdp, const struct drm_display_mode *mode);
++
+ /* histb_vdp_zme.c */
+ void histb_vdp_zme_load(void *coef, unsigned int in_w, unsigned int out_w,
+ 			unsigned int in_h, unsigned int out_h);
+ 
+ extern bool histb_vdp_allow_scale;
++extern bool histb_vdp_modeset;
+ extern int histb_vdp_csc_scale2p;
+ extern int histb_vdp_csc_shift;
+ 
+--- a/drivers/gpu/drm/hisilicon/histb/histb_vdp_drv.c
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp_drv.c
+@@ -6,9 +6,16 @@
+  * bootloader started: one CRTC whose single mode is read back from DHD0, a
+  * primary plane on the G0 graphics layer and an overlay plane on the V0 video
+  * layer that scans out NV12/NV21 directly from CMA memory (zero copy from the
+- * histb-vdec decoder).  It never re-programs timing, clocks, the HDMI block or
+- * the VDP reset - see histb_vdp_hw.c for the exact write set.
++ * histb-vdec decoder).  At load it never re-programs timing, clocks, the HDMI block
++ * or the VDP reset - see histb_vdp_hw.c for the exact write set.
+  *
++ * Mode setting (patch 0017, histb_vdp_mode.c): with an HDMI bridge in the device
++ * tree the connector comes from the bridge chain (EDID modes, HDR metadata,
++ * infoframes) and offers the adopted mode first.  A commit for that exact mode does
++ * what it always did - nothing to the hardware.  Only a commit for another mode
++ * retimes the PLL and DHD0 and, the first time, takes the pipe over.  modeset=0 or a
++ * device tree without the bridge keeps the original fixed-mode connector.
++ *
+  * Nothing in this driver has run on hardware yet.
+  */
+ 
+@@ -25,7 +32,10 @@
+ #include <drm/clients/drm_client_setup.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/bridge/histb_hdmi.h>
+ #include <drm/drm_blend.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_bridge_connector.h>
+ #include <drm/drm_connector.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_debugfs.h>
+@@ -40,6 +50,7 @@
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_modeset_helper.h>
++#include <drm/drm_of.h>
+ #include <drm/drm_plane_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
+@@ -52,6 +63,11 @@
+ MODULE_PARM_DESC(allow_scale,
+ 		 "let the video plane scale through the ZME (coefficient tables are unverified); default 1:1 only");
+ 
++bool histb_vdp_modeset = true;
++module_param_named(modeset, histb_vdp_modeset, bool, 0444);
++MODULE_PARM_DESC(modeset,
++		 "use the HDMI bridge: EDID modes and mode changes (default 1). 0 = the original fixed-mode connector that only adopts the bootloader's mode");
++
+ int histb_vdp_csc_scale2p = 10;
+ module_param_named(csc_scale2p, histb_vdp_csc_scale2p, int, 0444);
+ MODULE_PARM_DESC(csc_scale2p, "VDM YUV2RGB SCALE2P register value (vendor: 10)");
+@@ -241,16 +257,63 @@
+ 	if (!new->enable)
+ 		return 0;
+ 
+-	/* the timing generator is the bootloader's; only its own mode is valid */
++	if (vdp->modeset)
++		return histb_vdp_mode_valid(&new->adjusted_mode) == MODE_OK ? 0 : -EINVAL;
++
++	/* legacy: the timing generator is the bootloader's; only its own mode is valid */
+ 	if (!drm_mode_match(&new->mode, &vdp->mode,
+ 			    DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_FLAGS))
+ 		return -EINVAL;
+ 
+ 	return 0;
++}
++
++static enum drm_mode_status histb_vdp_crtc_mode_valid(struct drm_crtc *crtc,
++						      const struct drm_display_mode *mode)
++{
++	struct histb_vdp *vdp = to_histb_vdp(crtc->dev);
++
++	if (vdp->modeset)
++		return histb_vdp_mode_valid(mode);
++
++	return drm_mode_match(mode, &vdp->mode,
++			      DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_FLAGS) ?
++	       MODE_OK : MODE_BAD;
+ }
+ 
++/*
++ * Plane programming that was done BEFORE the CRTC was (re)timed: the commit helpers run
++ * the plane updates ahead of crtc_enable.  A VDP reset wipes it, and the V0 plane
++ * derives its VP0 size from vdp->mode, which only changes here - so write it again.
++ */
++static void histb_vdp_replay_planes(struct histb_vdp *vdp)
++{
++	struct drm_plane_state *g0 = vdp->primary.state, *v0 = vdp->overlay.state;
++
++	if (g0 && g0->crtc && g0->fb && g0->visible)
++		histb_vdp_hw_g0_update(vdp, g0);
++	if (v0 && v0->crtc && v0->fb && v0->visible)
++		histb_vdp_hw_v0_update(vdp, v0);
++}
++
+ static void histb_vdp_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state)
+ {
++	struct histb_vdp *vdp = to_histb_vdp(crtc->dev);
++	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
++
++	/*
++	 * (DRM_MODE_MATCH_TIMINGS leaves the clock out: 1080p60 at 148.5 MHz and the bootloader's
++	 * 59.94 Hz plan at 148.352 MHz have identical timings and need different PLLs.)
++	 * The mode the hardware already runs - the adopted one at load, or whatever this
++	 * driver set last - needs no hardware access at all.
++	 */
++	if (vdp->modeset &&
++	    !drm_mode_match(&new->adjusted_mode, &vdp->mode,
++			    DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK | DRM_MODE_MATCH_FLAGS)) {
++		if (!histb_vdp_hw_set_mode(vdp, &new->adjusted_mode))
++			histb_vdp_replay_planes(vdp);
++	}
++
+ 	drm_crtc_vblank_on(crtc);
+ }
+ 
+@@ -284,6 +347,7 @@
+ }
+ 
+ static const struct drm_crtc_helper_funcs histb_vdp_crtc_helpers = {
++	.mode_valid = histb_vdp_crtc_mode_valid,
+ 	.atomic_check = histb_vdp_crtc_check,
+ 	.atomic_enable = histb_vdp_crtc_enable,
+ 	.atomic_disable = histb_vdp_crtc_disable,
+@@ -339,6 +403,41 @@
+ 
+ 	drm_mode_probed_add(conn, mode);
+ 	return 1;
++}
++
++/*
++ * The bridge connector's modes are the sink's EDID modes.  Put the adopted mode first
++ * and make it the only PREFERRED one: the console client commits the preferred mode when
++ * the module loads, and that must be a commit for the mode already running (no hardware
++ * access), never the TV's native 4K one.  If the sink lists it with a different clock
++ * (the bootloader runs 59.94 Hz where the EDID says 60 Hz) it is added as an extra mode.
++ */
++static int histb_vdp_bconn_get_modes(struct drm_connector *conn)
++{
++	struct histb_vdp *vdp = to_histb_vdp(conn->dev);
++	struct drm_display_mode *mode;
++	bool found = false;
++	int n = vdp->bridge_conn_helpers->get_modes(conn);
++
++	list_for_each_entry(mode, &conn->probed_modes, head) {
++		if (drm_mode_match(mode, &vdp->boot_mode,
++				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK | DRM_MODE_MATCH_FLAGS)) {
++			mode->type |= DRM_MODE_TYPE_PREFERRED;
++			found = true;
++		} else {
++			mode->type &= ~DRM_MODE_TYPE_PREFERRED;
++		}
++	}
++
++	if (!found) {
++		mode = drm_mode_duplicate(conn->dev, &vdp->boot_mode);
++		if (mode) {
++			drm_mode_probed_add(conn, mode);
++			n++;
++		}
++	}
++
++	return n;
+ }
+ 
+ static enum drm_mode_status histb_vdp_conn_mode_valid(struct drm_connector *conn,
+@@ -378,6 +477,12 @@
+ #ifdef CONFIG_DEBUG_FS
+ static int histb_vdp_regs_show(struct seq_file *m, void *data)
+ {
++	struct histb_vdp *vdp = ((struct drm_debugfs_entry *)m->private)->file.data;
++
++	seq_printf(m, "modeset %d owned %d mode " DRM_MODE_FMT "\n", vdp->modeset, vdp->owned,
++		   DRM_MODE_ARG(&vdp->mode));
++	if (vdp->pixel)
++		seq_printf(m, "pixel clock %lu Hz\n", clk_get_rate(vdp->pixel));
+ 	histb_vdp_hw_dump(((struct drm_debugfs_entry *)m->private)->file.data, m); /* not vdp: drm_debugfs_add_file */
+ 	return 0;
+ }
+@@ -494,6 +599,62 @@
+ 			BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) |
+ 			BIT(DRM_COLOR_YCBCR_FULL_RANGE),
+ 			DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
++}
++
++static void histb_vdp_clks_off(void *data)
++{
++	struct histb_vdp *vdp = data;
++
++	clk_bulk_disable_unprepare(vdp->num_clks, vdp->clks);
++}
++
++static void (*histb_vdp_set_boot_mode)(struct drm_bridge *, const struct drm_display_mode *);
++
++/*
++ * symbol_get() pins histb_hdmi for as long as this device is bound (devres runs at
++ * unbind AND when probe fails half way).
++ */
++static void histb_vdp_put_bridge_symbol(void *unused)
++{
++	if (histb_vdp_set_boot_mode) {
++		symbol_put(histb_hdmi_set_boot_mode);
++		histb_vdp_set_boot_mode = NULL;
++	}
++}
++
++/* encoder -> bridge -> connector, and tell the bridge what the bootloader is running */
++static int histb_vdp_bind_bridge(struct histb_vdp *vdp)
++{
++	struct drm_device *drm = &vdp->drm;
++	int ret;
++
++	histb_vdp_set_boot_mode = symbol_get(histb_hdmi_set_boot_mode);
++	if (!histb_vdp_set_boot_mode)
++		return dev_err_probe(drm->dev, -ENODEV, "histb_hdmi is not loaded\n");
++	ret = devm_add_action_or_reset(drm->dev, histb_vdp_put_bridge_symbol, NULL);
++	if (ret)
++		return ret;
++	histb_vdp_set_boot_mode(vdp->bridge, &vdp->boot_mode);
++
++	ret = drm_bridge_attach(&vdp->encoder, vdp->bridge, NULL,
++				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
++	if (ret)
++		return dev_err_probe(drm->dev, ret, "attaching the HDMI bridge\n");
++
++	vdp->bconn = drm_bridge_connector_init(drm, &vdp->encoder);
++	if (IS_ERR(vdp->bconn))
++		return dev_err_probe(drm->dev, PTR_ERR(vdp->bconn),
++				     "creating the bridge connector\n");
++	ret = drm_connector_attach_encoder(vdp->bconn, &vdp->encoder);
++	if (ret)
++		return ret;
++
++	vdp->bridge_conn_helpers = vdp->bconn->helper_private;
++	vdp->conn_helpers = *vdp->bridge_conn_helpers;
++	vdp->conn_helpers.get_modes = histb_vdp_bconn_get_modes;
++	drm_connector_helper_add(vdp->bconn, &vdp->conn_helpers);
++
++	return 0;
+ }
+ 
+ static int histb_vdp_probe(struct platform_device *pdev)
+@@ -502,7 +663,7 @@
+ 	struct histb_vdp *vdp;
+ 	struct drm_device *drm;
+ 	u32 fb_base, fb_size;
+-	int ret;
++	int ret, i;
+ 
+ 	vdp = devm_drm_dev_alloc(dev, &histb_vdp_driver, struct histb_vdp, drm);
+ 	if (IS_ERR(vdp))
+@@ -517,16 +678,54 @@
+ 	if (vdp->irq < 0)
+ 		return vdp->irq;
+ 
++	vdp->modeset = histb_vdp_modeset;
++	if (vdp->modeset) {
++		struct drm_bridge *bridge = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
++
++		if (IS_ERR(bridge)) {
++			if (PTR_ERR(bridge) != -ENODEV)
++				return dev_err_probe(dev, PTR_ERR(bridge),
++						     "HDMI bridge (load histb_hdmi, or use modeset=0)\n");
++			dev_info(dev, "no output bridge in the device tree: fixed-mode connector\n");
++			vdp->modeset = false;
++		} else {
++			vdp->bridge = bridge;
++		}
++	}
++
+ 	/*
+ 	 * Clocks are optional: the bootloader already runs the whole pipe.
+ 	 * The V0 gate is the one it may have left off; the rest are held so
+ 	 * they cannot be gated while this driver owns the display.
++	 * "pixel" (the HDMI pixel clock) is NOT enabled here: this driver sets its
++	 * rate, the bridge owns its gate.
+ 	 */
+-	ret = devm_clk_bulk_get_all_enabled(dev, &vdp->clks);
++	ret = devm_clk_bulk_get_all(dev, &vdp->clks);
+ 	if (ret < 0 && ret != -ENOENT)
+-		return dev_err_probe(dev, ret, "enabling VDP clocks\n");
++		return dev_err_probe(dev, ret, "getting VDP clocks\n");
+ 	vdp->num_clks = max(ret, 0);
++	for (i = 0; i < vdp->num_clks; i++) {
++		if (!strcmp(vdp->clks[i].id, "pixel")) {
++			vdp->pixel = vdp->clks[i].clk;
++			vdp->clks[i] = vdp->clks[--vdp->num_clks];
++			break;
++		}
++	}
++	ret = clk_bulk_prepare_enable(vdp->num_clks, vdp->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "enabling VDP clocks\n");
++	ret = devm_add_action_or_reset(dev, histb_vdp_clks_off, vdp);
++	if (ret)
++		return ret;
+ 
++	if (vdp->modeset && !vdp->pixel) {
++		dev_warn(dev, "device tree has no \"pixel\" clock: fixed-mode connector\n");
++		vdp->modeset = false;
++	}
++	vdp->reset = devm_reset_control_get_optional_exclusive(dev, "vdp");
++	if (IS_ERR(vdp->reset))
++		return dev_err_probe(dev, PTR_ERR(vdp->reset), "VDP reset\n");
++
+ 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "DMA mask\n");
+@@ -535,6 +734,20 @@
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "bootloader display not running or not progressive\n");
++	/*
++	 * The registers hold no refresh rate; the pixel clock does.  The bootloader's
++	 * "1080p60" runs the 148.352 MHz plan, i.e. 59.94 Hz: say so, so the sink's 59.94
++	 * mode is recognised as the one already running.
++	 */
++	if (vdp->pixel) {
++		unsigned long rate = clk_get_rate(vdp->pixel);
++		unsigned long nominal = vdp->mode.clock * 1000UL;
++
++		if (rate && abs((long)rate - (long)nominal) < nominal / 100)
++			vdp->mode.clock = DIV_ROUND_CLOSEST(rate, 1000);
++		dev_info(dev, "pixel clock runs %lu Hz\n", rate);
++	}
++	vdp->boot_mode = vdp->mode;
+ 	dev_info(dev, "adopting bootloader mode " DRM_MODE_FMT "\n",
+ 		 DRM_MODE_ARG(&vdp->mode));
+ 
+@@ -569,14 +782,20 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = drm_connector_init(drm, &vdp->connector, &histb_vdp_conn_funcs,
+-				 DRM_MODE_CONNECTOR_HDMIA);
+-	if (ret)
+-		return ret;
+-	drm_connector_helper_add(&vdp->connector, &histb_vdp_conn_helpers);
+-	ret = drm_connector_attach_encoder(&vdp->connector, &vdp->encoder);
+-	if (ret)
+-		return ret;
++	if (vdp->modeset) {
++		ret = histb_vdp_bind_bridge(vdp);
++		if (ret)
++			return ret;
++	} else {
++		ret = drm_connector_init(drm, &vdp->connector, &histb_vdp_conn_funcs,
++					 DRM_MODE_CONNECTOR_HDMIA);
++		if (ret)
++			return ret;
++		drm_connector_helper_add(&vdp->connector, &histb_vdp_conn_helpers);
++		ret = drm_connector_attach_encoder(&vdp->connector, &vdp->encoder);
++		if (ret)
++			return ret;
++	}
+ 
+ 	ret = drm_vblank_init(drm, 1);
+ 	if (ret)
+@@ -588,6 +807,16 @@
+ 		return dev_err_probe(dev, ret, "VDP IRQ\n");
+ 
+ 	drm_mode_config_reset(drm);
++	if (vdp->modeset) {
++		/*
++		 * The pipe is 8 bit.  The bridge advertises up to 12 (that is what makes
++		 * HDR_OUTPUT_METADATA exist), but a commit must not pick deep colour on its
++		 * own: userspace raises "max bpc" when it can feed more.
++		 */
++		vdp->bconn->state->max_bpc = 8;
++		vdp->bconn->state->max_requested_bpc = 8;
++		drmm_kms_helper_poll_init(drm);
++	}
+ 	platform_set_drvdata(pdev, vdp);
+ 
+ 	/*
+@@ -621,8 +850,12 @@
+ 	/*
+ 	 * Leave the display alive and showing the bootloader's buffer rather
+ 	 * than scanning freed memory.  simpledrm does NOT come back by itself.
++	 * After a mode change the bootloader's buffer and chain are gone (the pipe was
++	 * reset and re-timed): the planes are off and the screen stays black until reboot
++	 * or until this module (or any DRM master) brings a plane up again.
+ 	 */
+-	histb_vdp_hw_restore_boot(vdp);
++	if (!vdp->owned)
++		histb_vdp_hw_restore_boot(vdp);
+ }
+ 
+ static const struct of_device_id histb_vdp_of_match[] = {
+@@ -641,5 +874,6 @@
+ };
+ module_platform_driver(histb_vdp_platform_driver);
+ 
+-MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDP DRM driver (adopts the bootloader display, NV12 video plane)");
++MODULE_SOFTDEP("pre: histb_hdmi");
++MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDP DRM driver (adopts the bootloader display, NV12 video plane, mode setting)");
+ MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/gpu/drm/hisilicon/histb/histb_vdp_mode.c
+@@ -0,0 +1,315 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Hi3798CV200 VDP - mode setting.
++ *
++ * Everything in this file runs ONLY when a commit asks for a mode other than the one
++ * DHD0 is already running.  Until then the driver stays what histb_vdp_hw.c describes:
++ * an adopter of the bootloader's pipe that writes nothing but its planes.
++ *
++ * The sequence is the community 6.12.y driver's, histb-vdp.c, ported unchanged in
++ * substance (resources_enable, program_axi, program_rgb_identity_path,
++ * program_timing, the DHD0 staging order), because it is the only one of the two
++ * halves of the video chain that has run on this silicon:
++ *
++ *   1. the HDMI pixel clock is retimed FIRST (clk_set_rate on the PLL).  If it does
++ *      not lock the clock driver has already put the old plan back and nothing else
++ *      has been touched;
++ *   2. once, on the first mode change: VDP soft reset, AXI/low-power setup, the
++ *      RGB identity colour path, the G0 -> GP0 -> mixer route.  The community TX setup
++ *      (histb-hdmi) assumes this RGB chain; the bootloader's chain is a different one
++ *      (hdmi_mode 0, DHD0 colour conversion on), so the two must be switched together;
++ *   3. every time: DHD0 interface off, timing, GP0 size, interface on.
++ *
++ * Not tested on hardware.
++ */
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++
++#include <drm/drm_modes.h>
++#include <drm/drm_print.h>
++
++#include "histb_vdp.h"
++
++#define HFRONT_MAX		0x10000
++#define VFRONT_MAX		0x400
++#define VSYNC_MAX		0x100
++
++/* what DHD0's fields can express, and what this display pipe is meant to carry */
++enum drm_mode_status histb_vdp_mode_valid(const struct drm_display_mode *mode)
++{
++	u32 hfront, hsync, hback, vfront, vsync, vback;
++
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		return MODE_NO_INTERLACE;
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
++	if (mode->hdisplay < 320 || mode->hdisplay > HISTB_VDP_MAX_W)
++		return MODE_BAD_HVALUE;
++	if (mode->vdisplay < 240 || mode->vdisplay > HISTB_VDP_MAX_H)
++		return MODE_BAD_VVALUE;
++
++	if (mode->hsync_start <= mode->hdisplay ||
++	    mode->hsync_end <= mode->hsync_start ||
++	    mode->htotal <= mode->hsync_end)
++		return MODE_H_ILLEGAL;
++	if (mode->vsync_start <= mode->vdisplay ||
++	    mode->vsync_end <= mode->vsync_start ||
++	    mode->vtotal <= mode->vsync_end)
++		return MODE_V_ILLEGAL;
++
++	hfront = mode->hsync_start - mode->hdisplay;
++	hsync = mode->hsync_end - mode->hsync_start;
++	hback = mode->htotal - mode->hsync_end;
++	vfront = mode->vsync_start - mode->vdisplay;
++	vsync = mode->vsync_end - mode->vsync_start;
++	vback = mode->vtotal - mode->vsync_end;
++
++	if (hfront > HFRONT_MAX || hback > HFRONT_MAX)
++		return MODE_BAD_HVALUE;
++	if (hsync > HFRONT_MAX)
++		return MODE_HSYNC_WIDE;
++	if (vfront > VFRONT_MAX || vback > VFRONT_MAX)
++		return MODE_BAD_VVALUE;
++	if (vsync > VSYNC_MAX)
++		return MODE_VSYNC_WIDE;
++
++	return MODE_OK;
++}
++
++/* ---------------------------------------------------------------------- */
++/* DHD0 staging                                                           */
++/* ---------------------------------------------------------------------- */
++
++static void dhd0_stage(struct histb_vdp *vdp, u32 set, u32 clear)
++{
++	u32 ctrl = readl(vdp->base + VDP_DHD0_CTRL);
++
++	ctrl &= ~clear;
++	ctrl |= set | DHD0_CTRL_REGUP;
++	writel(ctrl, vdp->base + VDP_DHD0_CTRL);
++	readl(vdp->base + VDP_DHD0_CTRL);
++}
++
++/* ---------------------------------------------------------------------- */
++/* once: take the pipe over from the bootloader                           */
++/* ---------------------------------------------------------------------- */
++
++/* CV200 reset completion shows as both VDPVERSION words reading 0 [read CM:535] */
++static int pipe_reset(struct histb_vdp *vdp)
++{
++	u32 v1;
++	int ret;
++
++	if (!vdp->reset) {
++		drm_warn(&vdp->drm, "no VDP reset line in the device tree: taking the pipe over WITHOUT a soft reset\n");
++		return 0;
++	}
++
++	vdp_wr(vdp, VDP_VOINTMSK, 0);
++	ret = reset_control_assert(vdp->reset);
++	if (ret)
++		return ret;
++	mb();
++	udelay(10);
++	ret = readl_poll_timeout(vdp->base + VDP_VERSION1, v1,
++				 !v1 && !readl(vdp->base + VDP_VERSION2),
++				 2000, 80000);
++	if (ret)
++		drm_err(&vdp->drm,
++			"VDP reset did not complete: VDPVERSION1=%08x VDPVERSION2=%08x\n",
++			readl(vdp->base + VDP_VERSION1),
++			readl(vdp->base + VDP_VERSION2));
++
++	/* never leave the block in reset, whatever the poll said */
++	if (reset_control_deassert(vdp->reset) && !ret)
++		ret = -EIO;
++	mb();
++	udelay(10);
++
++	return ret;
++}
++
++/* Values used by the CV200 BSP VDP_DRIVER_Initial() AXI setup [read CM:545-570]. */
++static void pipe_axi(struct histb_vdp *vdp)
++{
++	vdp_wr(vdp, VDP_VOLOWPOWER_CTRL, VOLOWPOWER_DEFAULT);
++	vdp_rmw(vdp, VDP_VOMIDORDER, 0, VOMIDORDER_MID_EN);
++	vdp_rmw(vdp, VDP_VOAXICTRL, VOAXICTRL_MASK, VOAXICTRL_VALUE);
++	vdp_rmw(vdp, VDP_VOAXICTRL1, VOAXICTRL1_MASK, VOAXICTRL1_VALUE & VOAXICTRL1_MASK);
++	/* G0 is the scanout layer and uses AXI master 0 in the CV200 BSP [read CM:493] */
++	vdp_rmw(vdp, VDP_VOMASTERSEL, BIT(14), 0);
++	/*
++	 * CV200's production VO HAL ignores the caller's value and hard-codes twochn_mode=1
++	 * together with DHD0 twochn_debug=1 [read CM:967-975].
++	 */
++	vdp_rmw(vdp, VDP_VOCTRL, 0, VOCTRL_CLK_GATE_EN | VOCTRL_TWOCHN_EN | VOCTRL_TWOCHN_MODE);
++}
++
++/*
++ * The graphics chain as plain RGB end to end [read CM:578-642]: every optional colour
++ * transform off, the CVM2 stage a Q14 identity (bypassing it does not preserve the
++ * graphics sample width: adjacent pixel lanes overflow differently before the mixer).
++ */
++static void pipe_identity_path(struct histb_vdp *vdp)
++{
++	unsigned int i;
++	u32 value;
++
++	vdp_rmw(vdp, VDP_GDM_CTRL, GDM_ENABLES, 0);
++	vdp_rmw(vdp, VDP_GDM_RGB2LMS_CTRL, BIT(0), 0);
++	vdp_rmw(vdp, VDP_HDR_CTRL, HDR_ENABLES, 0);
++	vdp_rmw(vdp, VDP_G0_CSC_IDC, CSC_ENABLE_G0, 0);
++	vdp_rmw(vdp, VDP_GP0_CSC_IDC, CSC_ENABLE_GP0, 0);
++	vdp_rmw(vdp, VDP_DHD0_CSC_IDC, CSC_ENABLE_DHD0, 0);
++
++	/* clear every CVM processing latch, but preserve output metadata bits */
++	value = vdp_rd(vdp, VDP_CVM_CTRL) & ~CVM_PIPE_ENABLES;
++	vdp_wr(vdp, VDP_CVM_CTRL, value);
++	vdp_rmw(vdp, VDP_CVM1_RGB2YUV_CTRL, BIT(0), 0);
++	vdp_rmw(vdp, VDP_CVM2_RGB2YUV_CTRL, BIT(0), 0);
++	for (i = 0; i < 9; i++)
++		vdp_wr(vdp, VDP_CVM2_RGB2YUV_COEF(i), i % 4 == 0 ? CVM2_CSC_UNITY : 0);
++	vdp_wr(vdp, VDP_CVM2_RGB2YUV_SCALE2P, CVM2_CSC_PRECISION | CVM2_CSC_SCALE_EN);
++	vdp_wr(vdp, VDP_CVM2_RGB2YUV_MIN, 0);
++	vdp_wr(vdp, VDP_CVM2_RGB2YUV_MAX, 0x7fff);
++	for (i = 0; i < 3; i++)
++		vdp_wr(vdp, VDP_CVM2_RGB2YUV_OUT_DC(i), 0);
++	vdp_wr(vdp, VDP_CVM_CTRL, value | CVM_ENABLE);
++	vdp_rmw(vdp, VDP_CVM2_RGB2YUV_CTRL, 0, BIT(0));
++	vdp_wr(vdp, VDP_HDR_UPD, 1);
++}
++
++/* DHD0 -> HDMI routing, the G0 -> GP0 -> mixer route [read CM:660-700] */
++static void pipe_route(struct histb_vdp *vdp)
++{
++	/* Match the same-device DHD default while HDMI HS/VS stay non-inverted. */
++	vdp_wr(vdp, VDP_DHD0_SYNC_INV, DHD0_SYNC_INV_HSYNC);
++	vdp_rmw(vdp, VDP_VO_MUX, VO_MUX_HDMI_SEL, 0);	/* DHD0 is source zero for the HDMI path */
++	vdp_wr(vdp, VDP_DHD0_DATA_SEL, 0);
++
++	pipe_identity_path(vdp);
++	vdp_wr(vdp, VDP_DHD0_HDMI_CLIP_L, 0);
++	vdp_wr(vdp, VDP_DHD0_HDMI_CLIP_H, DHD0_CLIP_FULL);
++
++	/* G0 through GP0, GP0 the only DHD0 mixer input (this driver's V0 write adds VP0 later) */
++	vdp_wr(vdp, VDP_MIXG0_MIX, 1);
++	vdp_wr(vdp, VDP_CBM_BKG1, 0);
++	vdp_wr(vdp, VDP_CBM_MIX1, CBM_LAYER_GP0);
++
++	/* stock Linux PQ clears both scaler enables for a 1:1 framebuffer */
++	vdp_rmw(vdp, VDP_GP0_ZME_HSP, GP0_ZME_ENABLE, 0);
++	vdp_rmw(vdp, VDP_GP0_ZME_VSP, GP0_ZME_ENABLE, 0);
++	vdp_wr(vdp, VDP_GP0_CTRL, GP0_CTRL_READ_PROG | GP0_ROUTE_ZME_CSC);
++	vdp_wr(vdp, VDP_GP0_GALPHA, 0xff);
++}
++
++/* ---------------------------------------------------------------------- */
++/* every time: timing                                                     */
++/* ---------------------------------------------------------------------- */
++
++static void retime(struct histb_vdp *vdp, const struct drm_display_mode *mode)
++{
++	u32 hfront = mode->hsync_start - mode->hdisplay;
++	u32 hsync = mode->hsync_end - mode->hsync_start;
++	u32 hback = mode->htotal - mode->hsync_end;
++	u32 vfront = mode->vsync_start - mode->vdisplay;
++	u32 vsync = mode->vsync_end - mode->vsync_start;
++	u32 vback = mode->vtotal - mode->vsync_end;
++	u32 size = VDP_SIZE(mode->hdisplay, mode->vdisplay);
++	u32 last = VDP_POS(mode->hdisplay - 1, mode->vdisplay - 1);
++
++	/*
++	 * The blanking fields include the sync pulse width; the encoding is the inverse of
++	 * histb_vdp_hw_read_mode() and was checked against the measured boot values
++	 * (HSYNC1 0x00BF077F, HSYNC2 0x57, VSYNC 0x00C28437, PWR 0x0004002B = 1080p60).
++	 */
++	vdp_wr(vdp, VDP_DHD0_HSYNC1, (mode->hdisplay - 1) | ((hback + hsync - 1) << 16));
++	vdp_wr(vdp, VDP_DHD0_HSYNC2, hfront - 1);
++	vdp_wr(vdp, VDP_DHD0_VSYNC, (mode->vdisplay - 1) | ((vback + vsync - 1) << 12) |
++				    ((vfront - 1) << 22));
++	vdp_wr(vdp, VDP_DHD0_VPLUS, 0);
++	vdp_wr(vdp, VDP_DHD0_PWR, (hsync - 1) | ((vsync - 1) << 16));
++
++	/* GP0 scans the framebuffer 1:1 */
++	vdp_wr(vdp, VDP_GP0_IRESO, size);
++	vdp_wr(vdp, VDP_GP0_ORESO, size);
++	vdp_wr(vdp, VDP_GP0_DFPOS, 0);
++	vdp_wr(vdp, VDP_GP0_DLPOS, last);
++	vdp_wr(vdp, VDP_GP0_VFPOS, 0);
++	vdp_wr(vdp, VDP_GP0_VLPOS, last);
++	writel(1, vdp->base + VDP_GP0_UPD);
++	readl(vdp->base + VDP_GP0_UPD);
++	vdp_wr(vdp, VDP_HDR_UPD, 1);
++}
++
++/* ---------------------------------------------------------------------- */
++/* entry                                                                  */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * Make DHD0 run @mode.  On failure the hardware is back (or still) on the previous mode
++ * and vdp->mode says so; the caller must not assume the new one is up.
++ */
++int histb_vdp_hw_set_mode(struct histb_vdp *vdp, const struct drm_display_mode *mode)
++{
++	unsigned long old_rate = vdp->mode.clock * 1000UL;
++	bool first = !vdp->owned;
++	int ret;
++
++	drm_info(&vdp->drm, "mode change %s -> " DRM_MODE_FMT "%s\n",
++		 vdp->mode.name, DRM_MODE_ARG(mode), first ? " (taking the pipe over)" : "");
++
++	/* 1. the PLL.  A failed lock was already rolled back by the clock driver. */
++	if (vdp->pixel) {
++		ret = clk_set_rate(vdp->pixel, mode->clock * 1000UL);
++		if (ret) {
++			drm_err(&vdp->drm, "pixel clock %lu Hz: %pe; staying on %s\n",
++				mode->clock * 1000UL, ERR_PTR(ret), vdp->mode.name);
++			return ret;
++		}
++	}
++
++	/* 2. once: reset and re-establish the whole chain, the way the community driver does */
++	if (first) {
++		ret = pipe_reset(vdp);
++		if (ret)
++			goto err_clock;
++		pipe_axi(vdp);
++		dhd0_stage(vdp, DHD0_CTRL_IOP | DHD0_CTRL_TWOCHN_DEBUG,
++			   DHD0_CTRL_INTF_EN | DHD0_CTRL_HDMI_MODE | DHD0_CTRL_P2I | DHD0_CTRL_CBAR);
++		pipe_route(vdp);
++	} else {
++		dhd0_stage(vdp, 0, DHD0_CTRL_INTF_EN);
++	}
++
++	/* 3. timing, then the interface on: staged exactly as the vendor does */
++	retime(vdp, mode);
++	dhd0_stage(vdp, DHD0_CTRL_IOP | DHD0_CTRL_HDMI_MODE | DHD0_CTRL_TWOCHN_DEBUG,
++		   DHD0_CTRL_INTF_EN | DHD0_CTRL_CBAR);
++	dhd0_stage(vdp, DHD0_CTRL_INTF_EN | DHD0_CTRL_IOP | DHD0_CTRL_HDMI_MODE |
++		   DHD0_CTRL_TWOCHN_DEBUG, DHD0_CTRL_CBAR);
++	dhd0_stage(vdp, 0, 0);		/* stock's second request */
++
++	vdp->mode = *mode;
++	if (first) {
++		vdp->owned = true;
++		/* a reset wiped the V0 colour core and the mixer: both are rebuilt on the next V0 update */
++		vdp->v0_chain_ready = false;
++		vdp->zme_key = 0;
++		vdp->boot.cbm_mix1 = CBM_LAYER_GP0;
++	}
++
++	/* the reset cleared the interrupt mask and the new mode needs a new threshold line */
++	histb_vdp_hw_vblank(vdp, vdp->vblank_on);
++
++	return 0;
++
++err_clock:
++	if (vdp->pixel && clk_set_rate(vdp->pixel, old_rate))
++		drm_err(&vdp->drm, "could not put the pixel clock back to %lu Hz\n", old_rate);
++	return ret;
++}

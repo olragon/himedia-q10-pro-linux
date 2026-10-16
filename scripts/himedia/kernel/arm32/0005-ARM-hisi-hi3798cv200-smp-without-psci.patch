@@ -1,0 +1,126 @@
+--- a/arch/arm/mach-hisi/platsmp.c	2026-10-11 16:05:21
++++ b/arch/arm/mach-hisi/platsmp.c	2026-10-11 16:16:11
+@@ -182,6 +182,123 @@
+ 	.smp_boot_secondary     = hip01_boot_secondary,
+ };
+ 
++/*
++ * Hi3798CV200 (4x Cortex-A53, booted in AArch32 by a 32-bit loader, no PSCI): the vendor 3.18
++ * kernel's non-TEE path (arch/arm/mach-hi3798cv2x/platsmp.c). A released core fetches from
++ * the on-chip SRAM at 0xffff0000, where we plant "ldr pc, [pc, #-4]" + the entry address; the
++ * CRG holds each core in two resets (PERI_CRG20 0x50: bit 8+n core, bit 12+n power-on), and
++ * the vendor drops the CPU clock to 400 MHz (PERI_CRG18 0x48 = 0x206 then 0x606, bit 10 is the
++ * switch strobe) around the release, then restores it.
++ */
++#define HI3798CV200_CRG_BASE		0xf8a22000
++#define HI3798CV200_CRG_CPU_LP		0x48
++#define HI3798CV200_CRG_CPU_RST		0x50
++#define HI3798CV200_CPU_SW_BEGIN	BIT(10)
++#define HI3798CV200_SC_BASE		0xf8000000
++#define HI3798CV200_SC_GEN1		0x84
++
++/*
++ * Secondary entry, physical, MMU and caches off. The A53 needs CPUECTLR.SMPEN (bit 6, the
++ * 64-bit CP15 register c15 opc1 1) set before it joins the coherent domain; the vendor stub
++ * does exactly this, then invalidates its L1 and enters the generic secondary_startup.
++ */
++static void __naked hi3798cv200_secondary_entry(void)
++{
++	asm volatile(
++	"	msr	cpsr_c, #0xd3\n"	/* SVC, IRQ and FIQ masked */
++	"	mrrc	p15, 1, r0, r1, c15\n"	/* CPUECTLR */
++	"	orr	r0, r0, #(1 << 6)\n"	/* SMPEN */
++	"	mcrr	p15, 1, r0, r1, c15\n"
++	"	isb\n"
++	"	bl	v7_invalidate_l1\n"
++	"	b	secondary_startup\n");
++}
++
++static int hi3798cv200_boot_secondary(unsigned int cpu, struct task_struct *idle)
++{
++	void __iomem *crg;
++	u32 lp, rst;
++
++	void __iomem *sc;
++
++	cpu = cpu_logical_map(cpu);
++	if (cpu < 1 || cpu > 3)
++		return -EINVAL;
++	/*
++	 * ⛔ Measured 2026-10-11: from Linux the SRAM at 0xffff0000 reads 0xfffe0b18 in every word
++	 * and ignores writes — it is not ours (secure), so the stub never lands and the cores
++	 * "failed to come online". This box loads a TEE (trustedcore), i.e. the vendor's CONFIG_TEE
++	 * path: the jump address goes in SC_GEN1 (sysctrl + 0x84), the secure firmware sets SMPEN
++	 * and the caches up itself, and the core enters secondary_startup directly. The SRAM stub
++	 * is still written: harmless where it is ignored, correct where it is not.
++	 */
++	hix5hd2_set_scu_boot_addr(HIX5HD2_BOOT_ADDRESS, __pa_symbol(hi3798cv200_secondary_entry));
++	sc = ioremap(HI3798CV200_SC_BASE, SZ_4K);
++	if (!sc)
++		return -ENOMEM;
++	writel_relaxed(__pa_symbol(secondary_startup), sc + HI3798CV200_SC_GEN1);
++	wmb();
++	iounmap(sc);
++
++	crg = ioremap(HI3798CV200_CRG_BASE, SZ_4K);
++	if (!crg)
++		return -ENOMEM;
++	/* A core may already be out of reset (an earlier kernel released it): put it back first. */
++	rst = readl_relaxed(crg + HI3798CV200_CRG_CPU_RST);
++	writel_relaxed(rst | BIT(8 + cpu) | BIT(12 + cpu), crg + HI3798CV200_CRG_CPU_RST);
++	udelay(10);
++	lp = readl_relaxed(crg + HI3798CV200_CRG_CPU_LP);
++	writel_relaxed(0x206, crg + HI3798CV200_CRG_CPU_LP);
++	writel_relaxed(0x206 | HI3798CV200_CPU_SW_BEGIN, crg + HI3798CV200_CRG_CPU_LP);
++	rst = readl_relaxed(crg + HI3798CV200_CRG_CPU_RST);
++	rst &= ~BIT(12 + cpu);				/* power-on reset */
++	writel_relaxed(rst, crg + HI3798CV200_CRG_CPU_RST);
++	rst &= ~BIT(8 + cpu);				/* core reset: it runs now */
++	writel_relaxed(rst, crg + HI3798CV200_CRG_CPU_RST);
++	writel_relaxed(lp & ~HI3798CV200_CPU_SW_BEGIN, crg + HI3798CV200_CRG_CPU_LP);
++	writel_relaxed(lp, crg + HI3798CV200_CRG_CPU_LP);
++	iounmap(crg);
++	pr_info("hi3798cv200: released CPU%u (CRG 0x50 = 0x%08x)\n", cpu, rst);
++	return 0;
++}
++
++#ifdef CONFIG_HOTPLUG_CPU
++/* The vendor never re-resets a core, so an offlined CPU parks here for good. */
++static void hi3798cv200_cpu_die(unsigned int cpu)
++{
++	flush_cache_all();
++	for (;;)
++		wfi();
++}
++
++/*
++ * Put a dead core back into both resets. Besides making hotplug real (boot_secondary releases
++ * it again), arm32 kexec REQUIRES cpu_kill: machine_kexec_prepare() returns -EINVAL when a
++ * platform can boot secondaries but not kill them (measured: kexec_load "Invalid argument").
++ */
++static int hi3798cv200_cpu_kill(unsigned int cpu)
++{
++	void __iomem *crg = ioremap(HI3798CV200_CRG_BASE, SZ_4K);
++
++	cpu = cpu_logical_map(cpu);
++	if (!crg || cpu < 1 || cpu > 3)
++		return 0;
++	writel_relaxed(readl_relaxed(crg + HI3798CV200_CRG_CPU_RST) | BIT(8 + cpu) | BIT(12 + cpu),
++		       crg + HI3798CV200_CRG_CPU_RST);
++	iounmap(crg);
++	return 1;
++}
++#endif
++
++static const struct smp_operations hi3798cv200_smp_ops __initconst = {
++	.smp_boot_secondary	= hi3798cv200_boot_secondary,
++#ifdef CONFIG_HOTPLUG_CPU
++	.cpu_die		= hi3798cv200_cpu_die,
++	.cpu_kill		= hi3798cv200_cpu_kill,
++#endif
++};
++
+ CPU_METHOD_OF_DECLARE(hi3xxx_smp, "hisilicon,hi3620-smp", &hi3xxx_smp_ops);
++CPU_METHOD_OF_DECLARE(hi3798cv200_smp, "hisilicon,hi3798cv200-smp", &hi3798cv200_smp_ops);
+ CPU_METHOD_OF_DECLARE(hix5hd2_smp, "hisilicon,hix5hd2-smp", &hix5hd2_smp_ops);
+ CPU_METHOD_OF_DECLARE(hip01_smp, "hisilicon,hip01-smp", &hip01_smp_ops);

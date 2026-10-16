@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Play in mpv (HW)",
+  "version": "1.0.0",
+  "description": "Hand web video to the hardware-decoding mpv on the Q10 Pro through a native-messaging host.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxxzziNUSrCzDKcKcorfUyBz40e2fr2rD1cKhFaVHl6GEFeSgri4cLI8uM1Bh2yIqhIZRZ1K3Vp/I2lmNYlU5sycKfvA6x6nJjAF90JzLGHpA6dzMzUwB5bkKURUqTzJqP3qvR215IrC8r9Ge2I5l3hf9LCjnGlQTO2xar+rocNf89sQ2DBIiJt3ONXC6XevCnLkf3zwf0z5fN6UiJSxMjhFDS6I4VXxquCDl3+u4JwyS5yC5k8p1OtfXOiTKWcswfhu271vGALUEFGtmGZZRpHmd7XsOSBQ8DvcKUIkIG8L3VdI0e99Awz61ravWEw+1TE5xfP3M4+mQezcta+WZqQIDAQAB",
+  "icons": { "48": "icon48.png" },
+  "permissions": ["nativeMessaging", "contextMenus", "notifications"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Play this page in mpv (HW)", "default_icon": { "48": "icon48.png" } },
+  "content_scripts": [
+    { "matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "run_at": "document_idle", "all_frames": true }
+  ]
+}

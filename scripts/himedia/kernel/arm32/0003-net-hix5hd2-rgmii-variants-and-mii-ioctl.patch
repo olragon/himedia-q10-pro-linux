@@ -1,0 +1,20 @@
+--- a/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c	2026-10-10 23:44:53
++++ b/drivers/net/ethernet/hisilicon/hix5hd2_gmac.c	2026-10-10 23:44:53
+@@ -292,6 +292,9 @@
+ 
+ 	switch (priv->phy_mode) {
+ 	case PHY_INTERFACE_MODE_RGMII:
++	case PHY_INTERFACE_MODE_RGMII_ID:
++	case PHY_INTERFACE_MODE_RGMII_RXID:
++	case PHY_INTERFACE_MODE_RGMII_TXID:
+ 		if (speed == SPEED_1000)
+ 			val = RGMII_SPEED_1000;
+ 		else if (speed == SPEED_100)
+@@ -907,6 +910,7 @@
+ 	.ndo_start_xmit		= hix5hd2_net_xmit,
+ 	.ndo_tx_timeout		= hix5hd2_net_timeout,
+ 	.ndo_set_mac_address	= hix5hd2_net_set_mac_address,
++	.ndo_eth_ioctl		= phy_do_ioctl_running,
+ };
+ 
+ static const struct ethtool_ops hix5hd2_ethtools_ops = {

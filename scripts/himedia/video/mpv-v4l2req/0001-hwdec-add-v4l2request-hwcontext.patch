@@ -1,0 +1,197 @@
+From 2c48b1c0da1b806f147d652e7b4cb9b976b12cc9 Mon Sep 17 00:00:00 2001
+From: tim <t@x>
+Date: Sun, 11 Oct 2026 23:02:47 +0700
+Subject: [PATCH] hwdec: add v4l2request hwcontext (Kwiboo PR #14511 adapted to
+ v0.40.0)
+
+Based on mpv-player/mpv#14511 (Jonas Karlman). Adaptations: meson.options (0.40 renamed
+meson_options.txt), has_header_symbol gets the libavutil dependency, hwdec_drmprime keeps the
+DRM device and registers a second V4L2REQUEST device on the same dmabuf interop instead of
+replacing it, hwdec_drmprime_overlay left untouched.
+---
+ meson.build                      | 10 +++++++++
+ meson.options                    |  1 +
+ video/hwdec.c                    |  3 +++
+ video/hwdec.h                    |  1 +
+ video/out/hwdec/hwdec_drmprime.c | 36 +++++++++++++++++++++++++++++++-
+ video/v4l2request.c              | 34 ++++++++++++++++++++++++++++++
+ 6 files changed, 84 insertions(+), 1 deletion(-)
+ create mode 100644 video/v4l2request.c
+
+diff --git a/meson.build b/meson.build
+index 7572769..e8106a4 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1411,6 +1411,15 @@ if features['ios-gl']
+     sources += files('video/out/hwdec/hwdec_ios_gl.m')
+ endif
+ 
++v4l2request = get_option('v4l2request').require(
++    cc.has_header_symbol('libavutil/hwcontext.h', 'AV_HWDEVICE_TYPE_V4L2REQUEST',
++                         dependencies: libavutil)
++)
++features += {'v4l2request': v4l2request.allowed()}
++if features['v4l2request']
++    sources += files('video/v4l2request.c')
++endif
++
+ libva = dependency('libva', version: '>= 1.1.0', required: get_option('vaapi'))
+ 
+ vaapi_drm = dependency('libva-drm', version: '>= 1.1.0', required:
+@@ -1868,6 +1877,7 @@ summary({'d3d11': features['d3d11'],
+          'libmpv': get_option('libmpv'),
+          'lua': features['lua'],
+          'opengl': features['gl'],
++         'v4l2request': features['v4l2request'],
+          'vulkan': features['vulkan'],
+          'wayland': features['wayland'],
+          'x11': features['x11']},
+diff --git a/meson.options b/meson.options
+index dae0a33..87a5ecc 100644
+--- a/meson.options
++++ b/meson.options
+@@ -99,6 +99,7 @@ option('d3d-hwaccel', type: 'feature', value: 'auto', description: 'D3D11VA hwac
+ option('d3d9-hwaccel', type: 'feature', value: 'auto', description: 'DXVA2 hwaccel')
+ option('gl-dxinterop-d3d9', type: 'feature', value: 'auto', description: 'OpenGL/DirectX DXVA2 hwaccel')
+ option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES interop support')
++option('v4l2request', type: 'feature', value: 'disabled', description: 'V4L2 Request API hwaccel')
+ option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
+ option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
+ 
+diff --git a/video/hwdec.c b/video/hwdec.c
+index deba518..de2ffec 100644
+--- a/video/hwdec.c
++++ b/video/hwdec.c
+@@ -125,6 +125,9 @@ static const struct hwcontext_fns *const hwcontext_fns[] = {
+ #if HAVE_DRM
+     &hwcontext_fns_drmprime,
+ #endif
++#if HAVE_V4L2REQUEST
++    &hwcontext_fns_v4l2request,
++#endif
+ #if HAVE_VAAPI
+     &hwcontext_fns_vaapi,
+ #endif
+diff --git a/video/hwdec.h b/video/hwdec.h
+index c83d207..ad74fb9 100644
+--- a/video/hwdec.h
++++ b/video/hwdec.h
+@@ -121,6 +121,7 @@ extern const struct hwcontext_fns hwcontext_fns_cuda;
+ extern const struct hwcontext_fns hwcontext_fns_d3d11;
+ extern const struct hwcontext_fns hwcontext_fns_drmprime;
+ extern const struct hwcontext_fns hwcontext_fns_dxva2;
++extern const struct hwcontext_fns hwcontext_fns_v4l2request;
+ extern const struct hwcontext_fns hwcontext_fns_vaapi;
+ extern const struct hwcontext_fns hwcontext_fns_vdpau;
+ 
+diff --git a/video/out/hwdec/hwdec_drmprime.c b/video/out/hwdec/hwdec_drmprime.c
+index 7869eb1..2ffdab3 100644
+--- a/video/out/hwdec/hwdec_drmprime.c
++++ b/video/out/hwdec/hwdec_drmprime.c
+@@ -39,6 +39,11 @@ extern const struct m_sub_options drm_conf;
+ 
+ struct priv_owner {
+     struct mp_hwdec_ctx hwctx;
++#if HAVE_V4L2REQUEST
++    // Second device, same dmabuf interop: libavcodec's v4l2request hwaccels
++    // are registered against an AV_HWDEVICE_TYPE_V4L2REQUEST device, not DRM.
++    struct mp_hwdec_ctx hwctx_v4l2req;
++#endif
+     int *formats;
+ 
+     struct dmabuf_interop dmabuf_interop;
+@@ -50,6 +55,11 @@ static void uninit(struct ra_hwdec *hw)
+     if (p->hwctx.driver_name)
+         hwdec_devices_remove(hw->devs, &p->hwctx);
+     av_buffer_unref(&p->hwctx.av_device_ref);
++#if HAVE_V4L2REQUEST
++    if (p->hwctx_v4l2req.driver_name)
++        hwdec_devices_remove(hw->devs, &p->hwctx_v4l2req);
++    av_buffer_unref(&p->hwctx_v4l2req.av_device_ref);
++#endif
+ }
+ 
+ static const dmabuf_interop_init interop_inits[] = {
+@@ -118,6 +128,18 @@ static int init(struct ra_hwdec *hw)
+                                      AV_HWDEVICE_TYPE_DRM,
+                                      device_path, NULL, 0);
+     talloc_free(tmp);
++#if HAVE_V4L2REQUEST
++    // Optional: absent on a box without a request-API decoder. The v4l2request
++    // device selects its media node itself (udev enumeration); no path argument.
++    int ret_v4l2req = av_hwdevice_ctx_create(&p->hwctx_v4l2req.av_device_ref,
++                                             AV_HWDEVICE_TYPE_V4L2REQUEST,
++                                             NULL, NULL, 0);
++    if (ret_v4l2req != 0)
++        MP_VERBOSE(hw, "No v4l2request hwdevice_ctx: %s\n", av_err2str(ret_v4l2req));
++    // The DRM device is not required when the v4l2request one exists.
++    if (ret != 0 && ret_v4l2req == 0)
++        ret = 0;
++#endif
+     if (ret != 0) {
+         MP_VERBOSE(hw, "Failed to create hwdevice_ctx: %s\n", av_err2str(ret));
+         return -1;
+@@ -149,7 +171,19 @@ static int init(struct ra_hwdec *hw)
+     p->hwctx.hw_imgfmt = IMGFMT_DRMPRIME;
+     p->hwctx.supported_formats = p->formats;
+     p->hwctx.driver_name = hw->driver->name;
+-    hwdec_devices_add(hw->devs, &p->hwctx);
++    if (p->hwctx.av_device_ref) {
++        hwdec_devices_add(hw->devs, &p->hwctx);
++    } else {
++        p->hwctx.driver_name = NULL;
++    }
++#if HAVE_V4L2REQUEST
++    if (p->hwctx_v4l2req.av_device_ref) {
++        p->hwctx_v4l2req.hw_imgfmt = IMGFMT_DRMPRIME;
++        p->hwctx_v4l2req.supported_formats = p->formats;
++        p->hwctx_v4l2req.driver_name = hw->driver->name;
++        hwdec_devices_add(hw->devs, &p->hwctx_v4l2req);
++    }
++#endif
+ 
+     return 0;
+ }
+diff --git a/video/v4l2request.c b/video/v4l2request.c
+new file mode 100644
+index 0000000..2aa4d14
+--- /dev/null
++++ b/video/v4l2request.c
+@@ -0,0 +1,34 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <libavutil/hwcontext.h>
++
++#include "hwdec.h"
++
++static struct AVBufferRef *v4l2request_create_standalone(struct mpv_global *global,
++        struct mp_log *log, struct hwcontext_create_dev_params *params)
++{
++    AVBufferRef* ref = NULL;
++    av_hwdevice_ctx_create(&ref, AV_HWDEVICE_TYPE_V4L2REQUEST, NULL, NULL, 0);
++
++    return ref;
++}
++
++const struct hwcontext_fns hwcontext_fns_v4l2request = {
++    .av_hwdevice_type = AV_HWDEVICE_TYPE_V4L2REQUEST,
++    .create_dev = v4l2request_create_standalone,
++};
+-- 
+2.50.1 (Apple Git-155)
+

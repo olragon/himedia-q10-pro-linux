@@ -1,0 +1,12 @@
+<settings version="2">
+    <!-- REQUIRED: CDisplaySettings::Load fails without a <resolutions> element, and a failed sub-settings load makes Kodi Reset()
+         ALL settings to defaults - silently discarding every value below. -->
+    <resolutions></resolutions>
+    <skinsettings></skinsettings>
+    <viewstates></viewstates>
+    <!-- Fallback preset: same hardware decoder, but render through the GLES/EGL dma-buf import instead of the video plane. -->
+    <setting id="videoplayer.useprimedecoder">true</setting>
+    <setting id="videoplayer.useprimedecoderforhw">true</setting>
+    <setting id="videoplayer.useprimerenderer">1</setting>
+    <setting id="debug.showloginfo">true</setting>
+</settings>

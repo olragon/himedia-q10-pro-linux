@@ -1,0 +1,13 @@
+# Q10: long-press SETUP/MENU on the remote or front panel -> session menu.
+[Unit]
+Description=Q10: session hotkey daemon
+After=q10-keymap.service
+
+[Service]
+ExecStart=/usr/local/sbin/q10-hotkey
+EnvironmentFile=-/etc/default/q10-hotkey
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

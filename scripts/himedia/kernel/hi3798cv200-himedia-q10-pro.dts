@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * DTS for the HiMedia Q10 Pro (HiSilicon Hi3798CV200)
+ *
+ * ⚠️ UNTESTED ON HARDWARE. Every address, interrupt and clock below is taken from a
+ * primary source — the stock firmware's own device tree (extracted from boot.img), the
+ * Hi3798CV200 register map in the vendor BSP, and a live read-only recon of the box —
+ * but nothing here has been booted. Where a value is a guess it says so.
+ *
+ * Requires: 0001-clk-hisilicon-crg-hi3798cv200-add-SATA-clocks.patch
+ *           (mainline does not register the SATA clocks)
+ *
+ * Bring-up order matters. First boot should prove serial + eMMC + Ethernet only; USB3 is
+ * therefore left disabled below, because an unverified PHY pairing that wedges the USB
+ * controller during probe would be indistinguishable from a kernel that failed to boot.
+ *
+ * ref: docs/261010-himedia-q10-pro-vendor-dtb.md
+ * ref: docs/261010-himedia-q10-pro-recon-findings.md
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
+#include "hi3798cv200.dtsi"
+
+/ {
+	model = "HiMedia Q10 Pro";
+	compatible = "himedia,q10-pro", "hisilicon,hi3798cv200";
+
+	aliases {
+		serial0 = &uart0;
+		serial2 = &uart2;
+	};
+
+	chosen {
+		/* Confirmed from the stock cmdline: console=ttyAMA0,115200 */
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/*
+		 * 2 GB. The stock cmdline reserves 56 MB for the vendor media zone
+		 * (mmz=ddr,0,0,56M) and boots with mem=1993M; mainline has no VPU driver,
+		 * so that reservation is not needed and the full 2 GB is given to Linux.
+		 */
+		reg = <0x0 0x0 0x0 0x80000000>;
+	};
+};
+
+/*
+ * SATA — the reason this box is worth converting.
+ *
+ * Confirmed: base 0xf9900000 (soc-relative 0x9900000) and IRQ 0x46 both appear in the
+ * stock device tree, and the stock tree also uses compatible "generic-ahci", so the
+ * mainline generic AHCI driver is the right one.
+ *
+ * The four clocks are PERI_CRG42 (CRG offset 0xa8) bits 0..3 and the four resets are
+ * bits 8..11 of the same register, per the Hi3798CV200 register map:
+ *   bit 0 sata_bus_cken        bit 8  sata_bus_srst_req
+ *   bit 1 sata_rx0_cken        bit 9  sata_cko_alive_srst_req
+ *   bit 2 sata_cko_alive_cken  bit 10 sata_rx0_srst_req
+ *   bit 3 sata_tx0_cken        bit 11 sata0_srst_req
+ */
+&soc {
+	sata: sata@9900000 {
+		compatible = "generic-ahci";
+		reg = <0x9900000 0x1000>;
+		interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_SATA_BUS_CLK>,
+			 <&crg HISTB_SATA_RX0_CLK>,
+			 <&crg HISTB_SATA_CKO_ALIVE_CLK>,
+			 <&crg HISTB_SATA_TX0_CLK>;
+		resets = <&crg 0xa8 8>,
+			 <&crg 0xa8 9>,
+			 <&crg 0xa8 10>,
+			 <&crg 0xa8 11>;
+		reset-names = "bus", "cko-alive", "rx0", "sata0";
+		phys = <&combphy1 PHY_TYPE_SATA>;
+		phy-names = "sata-phy";
+		status = "okay";
+	};
+
+	/*
+	 * USB 3.0. Both controllers exist and both are live under the stock firmware.
+	 * This box's stock kernel binds the SuperSpeed port on xhci1 (f98b0000), but the
+	 * combo-PHY pairing is the open question — see the note under &combphy1 — so both
+	 * stay disabled until first boot succeeds without them.
+	 *
+	 * Needs no kernel patch: mainline already registers both instances' clocks
+	 * (the plain set for xhci0, the *_CLK1 set for xhci1) as gates on CRG 0xb0.
+	 */
+	xhci0: usb@98a0000 {
+		compatible = "hisilicon,hi3798cv200-xhci";
+		reg = <0x98a0000 0x10000>;
+		interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_USB3_BUS_CLK>,
+			 <&crg HISTB_USB3_UTMI_CLK>,
+			 <&crg HISTB_USB3_PIPE_CLK>,
+			 <&crg HISTB_USB3_SUSPEND_CLK>;
+		clock-names = "bus", "utmi", "pipe", "suspend";
+		resets = <&crg 0xb0 12>;
+		reset-names = "soft";
+		/* ⚠️ GUESS: the usb2-phy port pairing is not stated by any source I have. */
+		phys = <&usb2_phy2_port0>, <&combphy0 PHY_TYPE_USB3>;
+		phy-names = "usb", "combo";
+		status = "disabled";
+	};
+
+	xhci1: usb@98b0000 {
+		compatible = "hisilicon,hi3798cv200-xhci";
+		reg = <0x98b0000 0x10000>;
+		interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&crg HISTB_USB3_BUS_CLK1>,
+			 <&crg HISTB_USB3_UTMI_CLK1>,
+			 <&crg HISTB_USB3_PIPE_CLK1>,
+			 <&crg HISTB_USB3_SUSPEND_CLK1>;
+		clock-names = "bus", "utmi", "pipe", "suspend";
+		resets = <&crg 0xb0 13>;
+		reset-names = "soft";
+		/*
+		 * ⚠️ Deliberately NO combo phy. combphy1 is taken by SATA above, and these
+		 * are the same lane — so this controller is USB 2.0 only once SATA is in use.
+		 * ⚠️ GUESS: both the usb2-phy pairing and reset bit 13 are unverified.
+		 */
+		phys = <&usb2_phy1_port1>;
+		phy-names = "usb";
+		status = "disabled";
+	};
+};
+
+/*
+ * combphy1 carries SATA.
+ *
+ * The mux is already upstream — hi3798cv200.dtsi declares
+ * `hisilicon,mode-select-bits = <0x0008 11 (0x3 << 11)>`, which is exactly the vendor's
+ * PERI_CTRL offset 0x8 with BIT(11)|BIT(12), encoding 00=PCIe, 01=USB3, 10=SATA. So only
+ * the clock rate needs changing: the vendor's SATA path runs this PHY from the 25 MHz
+ * VPLL, while the dtsi default is 100 MHz.
+ *
+ * The combphy1 clock's parent is a mux over {100m, 25m} with CLK_SET_RATE_PARENT, so
+ * asking for 25 MHz here selects the 25 MHz parent. (The reference port instead points
+ * assigned-clock-parents at driver-private clock ids 0x50/0x42, which are not part of the
+ * published binding — this form avoids depending on those.)
+ *
+ * ⛔ Taking this lane for SATA costs the second USB3 controller its SuperSpeed capability.
+ *    That is a hardware constraint, not a configuration choice.
+ */
+&combphy1 {
+	assigned-clocks = <&crg HISTB_COMBPHY1_CLK>;
+	assigned-clock-rates = <25000000>;
+};
+
+/* eMMC — 16 GB, non-removable, 8-bit. */
+&emmc {
+	/*
+	 * ⚠️ NO pinctrl. Poplar points at a board pinctrl file that does not exist for this
+	 * box, so the pads are left as the bootloader muxed them. eMMC is the device the
+	 * bootloader itself just read the kernel from, so it is the safest case for this
+	 * assumption — but it IS an assumption, and a first boot that cannot find a root
+	 * device should suspect it.
+	 */
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	non-removable;
+	status = "okay";
+};
+
+/* SD card slot (the box has one on the side). */
+&sd0 {
+	bus-width = <4>;
+	cap-sd-highspeed;
+	status = "okay";
+};
+
+/*
+ * Gigabit Ethernet. The stock kernel binds f9841000.ethernet, i.e. gmac1 — not gmac0 —
+ * and the stock device tree gives phy-mode "rgmii" with the PHY at address 3.
+ */
+&gmac1 {
+	phy-handle = <&phy1>;
+	phy-mode = "rgmii";
+	status = "okay";
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		phy1: ethernet-phy@3 {
+			reg = <3>;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&ir {
+	status = "okay";
+};
+
+/*
+ * ⛔ PCIe stays DISABLED. It is the third option on combphy1's mux, so enabling it would
+ * contend with SATA — and the recon found no PCIe device on this board anyway
+ * (/sys/bus/pci/devices/ is empty; the Wi-Fi module is SDIO on mmc2).
+ */

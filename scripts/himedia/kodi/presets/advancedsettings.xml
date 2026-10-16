@@ -1,0 +1,5 @@
+<!-- Q10 Pro / Kodi v4l2request: debug log so the hwdevice + decoder lines are visible in ~/.kodi/temp/kodi.log.
+     loglevel 1 = debug. Remove (or set 0) once the path is proven: debug logging is noisy and costs CPU. -->
+<advancedsettings version="1.0">
+  <loglevel>1</loglevel>
+</advancedsettings>

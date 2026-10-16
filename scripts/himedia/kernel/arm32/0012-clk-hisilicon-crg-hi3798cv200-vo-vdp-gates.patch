@@ -1,0 +1,72 @@
+LOCAL PATCH (not submitted anywhere): clk: hisilicon: crg-hi3798cv200 - add the VO / VDP gates
+
+Mainline registers no clock object for the video output block, so the Hi3798CV200
+display processor could never name its gates.  Seven simple gates are added, ids
+90..96 (the community 6.12 tree numbers them 70..77 and 90, which collide with this
+tree's inner-clock window 64..89):
+
+  CRG 0xd8  (PERI_CRG54)  bit 0 vo_bus, bit 4 vo_hd, bit 31 vdp_cfg
+  CRG 0x34c               bit 0 vo_bp, bit 11 vdp_g0, bit 13 vdp_v0, bit 14 vdp_hd
+
+⛔ Registering a clock object that nothing consumes is not free: clk_disable_unused()
+closes every enabled, unclaimed gate at late_initcall.  The bootloader's boot logo is
+scanned out through exactly these gates, so with histb-vdp not loaded (it is a
+blacklisted module) a plain gate would blank the TV.  All gates the boot display depends
+on are therefore CLK_IS_CRITICAL, which keeps them open and changes no register (they
+are already set).  Only vdp_v0 - the video layer, unused by the boot logo - is an
+ordinary gate that histb-vdp enables when it needs it.
+
+The soft reset (CRG 0xd8 bit 30) is deliberately NOT exposed: histb-vdp adopts the
+running pipe and must never reset it.
+
+Not tested on hardware.  Compile-tested with ARCH=arm, gcc 14 (trixie cross toolchain).
+Needs 0001..0010 first.
+
+--- a/include/dt-bindings/clock/histb-clock.h
++++ b/include/dt-bindings/clock/histb-clock.h
+@@ -90,6 +90,19 @@
+  */
+ #define HISTB_GPU_CLK			61
+ 
++/*
++ * Video output / display processor gates (histb-vdp).  The community 6.12 tree
++ * numbers these 70..77 and 90, which collide with our inner-clock window
++ * (64..89); they take free public ids 90..96 here.  CRG 0xd8 and CRG 0x34c.
++ */
++#define HISTB_VO_BUS_CLK		90
++#define HISTB_VO_HD_CLK			91
++#define HISTB_VDP_CFG_CLK		92
++#define HISTB_VDP_HD_CLK		93
++#define HISTB_VDP_G0_CLK		94
++#define HISTB_VDP_V0_CLK		95
++#define HISTB_VO_BP_CLK			96
++
+ /* clocks provided by mcu CRG */
+ #define HISTB_MCE_CLK			1
+ #define HISTB_IR_CLK			2
+--- a/drivers/clk/hisilicon/crg-hi3798cv200.c
++++ b/drivers/clk/hisilicon/crg-hi3798cv200.c
+@@ -234,6 +234,23 @@
+ 		CLK_SET_RATE_PARENT, 0xa8, 2, 0 },
+ 	{ HISTB_SATA_TX0_CLK, "clk_sata_tx0", NULL,
+ 		CLK_SET_RATE_PARENT, 0xa8, 3, 0 },
++	/*
++	 * Video output / display processor (histb-vdp).  The bootloader leaves
++	 * the display running with these gates open; before this patch no clock
++	 * object existed for them, so nothing could gate them.  Registering them
++	 * would let clk_disable_unused() close them (blank screen) whenever the
++	 * module is not loaded, hence CLK_IS_CRITICAL on everything the boot
++	 * display depends on.  Only V0 (the video layer, unused by the boot logo)
++	 * is an ordinary gate that the driver enables when it needs it.
++	 * CRG 0xd8 = PERI_CRG54, CRG 0x34c = VDP clock control.
++	 */
++	{ HISTB_VO_BUS_CLK, "clk_vo_bus", NULL, CLK_IS_CRITICAL, 0xd8, 0, 0 },
++	{ HISTB_VO_HD_CLK, "clk_vo_hd", NULL, CLK_IS_CRITICAL, 0xd8, 4, 0 },
++	{ HISTB_VDP_CFG_CLK, "clk_vdp_cfg", NULL, CLK_IS_CRITICAL, 0xd8, 31, 0 },
++	{ HISTB_VDP_HD_CLK, "clk_vdp_hd", NULL, CLK_IS_CRITICAL, 0x34c, 14, 0 },
++	{ HISTB_VDP_G0_CLK, "clk_vdp_g0", NULL, CLK_IS_CRITICAL, 0x34c, 11, 0 },
++	{ HISTB_VDP_V0_CLK, "clk_vdp_v0", NULL, 0, 0x34c, 13, 0 },
++	{ HISTB_VO_BP_CLK, "clk_vo_bp", NULL, CLK_IS_CRITICAL, 0x34c, 0, 0 },
+ };
+ 
+ /*
